@@ -120,6 +120,36 @@ function logicChecks(H, check) {
     assert.ok(f.some(function (x) { return /weeks old/.test(x.title) && x.severity === 'minor'; }));
     assert.ok(f.some(function (x) { return /low E/.test(x.title) && x.severity === 'ok'; }));
   });
+  run('markdown report: all sections, grid as text, DIY/LUTHIER tags, diff vs previous', function () {
+    const note = function (cents, extra) { return Object.assign({ found: true, matches: true, freq: 100 * Math.pow(2, cents / 1200), cents: cents, spreadCents: 1, decaySec: 2, decayCapped: true }, extra || {}); };
+    const sweepRow = function () { return new Array(12).fill(null); };
+    const sweep = [0, 1, 2, 3, 4, 5].map(sweepRow);
+    sweep[0] = sweep[0].map(function (_, f) { return f < 4 ? note(1, { userBuzz: f === 1 }) : f === 4 ? { skipped: true } : null; });
+    const raw = {
+      manual: { guitar: 'Test LP', stringAgeWeeks: '20', reliefMm: '0.3' },
+      intonation: [{ ref: note(0), fretted: note(9), refKind: 'open' }, null, null, null, null, null],
+      nut: [0, 1, 2, 3, 4, 5].map(function () { return { open: note(0), fret1: note(12) }; }),
+      sweep: sweep,
+      stability: { before: [0, 1, 2, 3, 4, 5].map(function () { return note(0); }), beforeAt: 0,
+        after: [0, 1, 2, 3, 4, 5].map(function (i) { return note(i === 2 ? -7 : 0); }), afterAt: 600000 },
+      pressure: { chord: 'C', notes: [null, null, null, null, null, null] },
+      balance: [-20, -21, -19, -29, -20, -20]
+    };
+    const report = {
+      intonation: raw.intonation.map(function (x, s) { return x ? H.intonation(s, x.ref, x.fretted, x.refKind) : null; }),
+      nut: H.nut(raw.nut), sweep: H.sweep(raw.sweep), stability: H.stability(raw.stability.before, raw.stability.after, 10),
+      balance: H.balance(raw.balance), manual: raw.manual
+    };
+    const entry = { date: '2026-11-06T21:30:00.000Z', meta: { input: 'iRig HD 2', sampleRate: 48000 }, raw: raw, report: report, findings: H.summarize(report) };
+    const prev = { date: '2026-10-01T10:00:00.000Z', report: { manual: { reliefMm: '0.5' } } };
+    const md = H.reportMarkdown(entry, prev);
+    ['# Guitar Health Check - 2026-11-06', 'Guitar: Test LP', 'Strings: 20 weeks old', 'Input: iRig HD 2 @ 48000 Hz',
+      '## Findings', '[LUTHIER]', '[DIY]', 'confidence]', '## Intonation', '## Nut', '## Fret sweep', '## Tuning stability',
+      '## String balance', '## Diff vs previous run (2026-10-01)', '| reliefMm | 0.5 | 0.3 | -0.2 |'].forEach(function (t) {
+      assert.ok(md.indexOf(t) >= 0, 'missing: ' + t);
+    });
+    assert.ok(/E6 +\. +B +\. +\. +-/.test(md), 'sweep status row for low E');
+  });
   run('summary sorts major before minor before ok; compare lists keys', function () {
     const rep = { manual: { reliefMm: '0.6', stringAgeWeeks: '2' } };
     const s = H.summarize(rep);

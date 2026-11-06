@@ -98,6 +98,7 @@ input[type=range] { width: 100%; height: 36px; }
 .finding.major { border-left: 5px solid var(--bad); }
 .finding.minor { border-left: 5px solid var(--warn); }
 .finding.ok { border-left: 5px solid var(--ok); }
+textarea { width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 8px; }
 input.num { min-height: var(--tap); width: 120px; font: inherit; padding: 0 12px; border-radius: 12px;
   border: 1px solid var(--line); background: var(--panel-2); color: var(--text); }
 </style>
@@ -668,12 +669,13 @@ var GuitarHealth = (function () {
   }
 
   // ---------- 3. fret sweep ----------
-  // grid[string][fret-1] = analyzeNote result + { userBuzz } (or null = skipped), frets 1..12.
+  // grid[string][fret-1] = analyzeNote result + { userBuzz }, { skipped: true }, or null (not tested yet). Frets 1..12.
   // Dead / undetected are automatic; buzz comes from the player's ear (see attackNoise note).
   function sweep(grid) {
     const cells = grid.map(function (row) {
       return row.map(function (m, f) {
-        if (m === null || m === undefined) return { status: 'skipped' };
+        if (m === null || m === undefined) return { status: 'untested' };
+        if (m.skipped) return { status: 'skipped' };
         if (!m.found || !m.matches) return { status: 'undetected', heard: m.found ? m.name : null };
         const neighbours = row.slice(Math.max(0, f - 2), f + 3)
           .filter(function (n) { return n && n.found && n.matches && n !== m; })
@@ -689,7 +691,7 @@ var GuitarHealth = (function () {
   function sweepFindings(cells) {
     const list = [];
     cells.forEach(function (row, s) { row.forEach(function (c, f) { list.push({ s: s, fret: f + 1, c: c }); }); });
-    const tested = list.filter(function (x) { return x.c.status !== 'skipped'; });
+    const tested = list.filter(function (x) { return x.c.status !== 'skipped' && x.c.status !== 'untested'; });
     if (!tested.length) return [];
     const buzz = list.filter(function (x) { return x.c.status === 'buzz'; });
     const dead = list.filter(function (x) { return x.c.status === 'dead'; });
@@ -884,11 +886,116 @@ var GuitarHealth = (function () {
 
   function fmtCents(c) { return (c >= 0 ? '+' : '') + c.toFixed(1) + ' c'; }
 
+  // ---------- markdown export (for pasting into a chat) ----------
+  // entry: { date, meta: { guitar, input, sampleRate }, raw: draft, report, findings }; prev: previous entry or null.
+  const SWEEP_SYMBOL = { ok: '.', buzz: 'B', dead: 'D', undetected: '?', skipped: '-' };
+  const STRING_SHORT = ['E6', 'A5', 'D4', 'G3', 'B2', 'e1'];
+
+  function r1(v) { return v === null || v === undefined || isNaN(v) ? '-' : (Math.round(v * 10) / 10).toFixed(1); }
+  function sc(v) { return v === null || v === undefined || isNaN(v) ? '-' : (v >= 0 ? '+' : '') + r1(v); }
+  function mdTable(head, rows) {
+    return ['| ' + head.join(' | ') + ' |', '|' + head.map(function () { return '---'; }).join('|') + '|']
+      .concat(rows.map(function (r) { return '| ' + r.join(' | ') + ' |'; })).join('\n');
+  }
+
+  function mdFindings(list) {
+    if (!list || !list.length) return '_none_';
+    return list.map(function (f) {
+      return '- [' + f.severity.toUpperCase() + '] [' + f.who + '] [' + f.confidence + ' confidence] ' + f.title +
+        (f.detail ? ' - ' + f.detail : '') + (f.fix ? ' Fix: ' + f.fix : '');
+    }).join('\n');
+  }
+
+  function mdSweep(raw, report) {
+    if (!report.sweep) return null;
+    const cells = report.sweep.cells;
+    const pad = function (v, w) { v = String(v); while (v.length < w) v = ' ' + v; return v; };
+    const header = 'str  ' + [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map(function (f) { return pad(f, 3); }).join('');
+    const rows = function (fn) {
+      return [5, 4, 3, 2, 1, 0].map(function (s) {
+        return STRING_SHORT[s] + '   ' + cells[s].map(function (c, f) { return pad(fn(c, raw.sweep[s][f]), 3); }).join('');
+      }).join('\n');
+    };
+    return '```\nstatus (. ok, B buzz marked by player, D short sustain, ? not detected, - skipped, blank not tested)\n' +
+      header + '\n' + rows(function (c) { return SWEEP_SYMBOL[c.status] || ''; }) +
+      '\n\ncents vs equal temperament\n' + header + '\n' + rows(function (c, m) { return m && m.found ? Math.round(m.cents) : ''; }) +
+      '\n\nsustain to -20 dB (s; ">" = rang past the 2.2 s capture)\n' + header + '\n' +
+      rows(function (c, m) { return m && m.found ? (m.decayCapped ? '>' : '') + r1(m.decaySec) : ''; }) + '\n```';
+  }
+
+  function reportMarkdown(entry, prev) {
+    const raw = entry.raw || {}, rep = entry.report || {}, meta = entry.meta || {}, man = raw.manual || {};
+    const d = new Date(entry.date), p2 = function (n) { return (n < 10 ? '0' : '') + n; };
+    const local = d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+    const out = ['# Guitar Health Check - ' + local];
+    out.push('- Guitar: ' + (man.guitar || meta.guitar || 'not set'));
+    out.push('- Strings: ' + (man.stringAgeWeeks !== undefined ? man.stringAgeWeeks + ' weeks old' : 'age not entered'));
+    out.push('- Input: ' + (meta.input || 'unknown') + (meta.sampleRate ? ' @ ' + meta.sampleRate + ' Hz' : ''));
+    out.push('- Method: plucked notes through the input; pitch = median of the steady part (0.25-1.2 s after the attack), ' +
+      'low-passed above the fundamental. Buzz is marked by ear, not measured.');
+
+    out.push('\n## Findings\n' + mdFindings(entry.findings));
+
+    const mk = ['reliefMm', 'actionBassMm', 'actionTrebleMm', 'pickupNeckMm', 'pickupBridgeMm'];
+    const mLabels = { reliefMm: 'neck relief', actionBassMm: 'action 12th low E', actionTrebleMm: 'action 12th high e', pickupNeckMm: 'neck pickup height', pickupBridgeMm: 'bridge pickup height' };
+    const mRows = mk.filter(function (k) { return man[k] !== undefined; }).map(function (k) { return [mLabels[k], man[k] + ' mm']; });
+    if (mRows.length) out.push('\n## Manual measurements\n' + mdTable(['measure', 'value'], mRows));
+
+    if (raw.intonation && raw.intonation.some(Boolean)) {
+      out.push('\n## Intonation (cents vs equal temperament; offset = 12th fret vs reference x2)\n' + mdTable(
+        ['string', 'reference', 'ref cents', '12th cents', 'offset', 'status'],
+        raw.intonation.map(function (x, s) {
+          if (!x) return [STRING_SHORT[s], '-', '-', '-', '-', 'not measured'];
+          const r = rep.intonation && rep.intonation[s];
+          return [STRING_SHORT[s], x.refKind, sc(x.ref.cents), sc(x.fretted.cents), r ? sc(r.offsetCents) : '-', r ? r.status : '-'];
+        })));
+    }
+    if (raw.nut && raw.nut.some(Boolean)) {
+      out.push('\n## Nut (1st fret vs open; should be +100 c, shown as excess)\n' + mdTable(['string', 'open cents', '1st fret cents', 'excess'],
+        raw.nut.map(function (x, s) {
+          const r = rep.nut && rep.nut.rows[s];
+          return x ? [STRING_SHORT[s], sc(x.open.cents), sc(x.fret1.cents), r ? sc(r.sharpCents) : '-'] : [STRING_SHORT[s], '-', '-', '-'];
+        })));
+    }
+    const sw = mdSweep(raw, rep);
+    if (sw) out.push('\n## Fret sweep (frets 1-12)\n' + sw);
+    if (rep.stability) {
+      out.push('\n## Tuning stability (drift after ' + Math.round(rep.stability.minutes) + ' min)\n' + mdTable(['string', 'before', 'after', 'drift'],
+        rep.stability.rows.map(function (r, s) {
+          const b = raw.stability.before[s], a = raw.stability.after[s];
+          return [STRING_SHORT[s], b && b.found ? sc(b.cents) : '-', a && a.found ? sc(a.cents) : '-', r ? sc(r.driftCents) : '-'];
+        })));
+    }
+    if (rep.pressure) {
+      out.push('\n## Fretting pressure (chord ' + raw.pressure.chord + ', cents vs open-string reference)\n' + mdTable(['string', 'fretted', 'cents'],
+        rep.pressure.rows.map(function (r) { return [STRING_SHORT[r.string], r.fretted ? 'yes' : 'open', sc(r.cents)]; })));
+    }
+    if (rep.balance) {
+      out.push('\n## String balance (open strings; low confidence)\n' + mdTable(['string', 'peak dBFS', 'vs median'],
+        raw.balance.map(function (db, s) {
+          const r = rep.balance.rows.find(function (x) { return x.string === s; });
+          return [STRING_SHORT[s], db === null ? '-' : r1(db), r ? sc(r.relDb) + ' dB' : '-'];
+        })));
+    }
+    if (prev && prev.report) {
+      const rows = compare(prev.report, rep).filter(function (r) { return r.before !== null || r.after !== null; });
+      out.push('\n## Diff vs previous run (' + String(prev.date).slice(0, 10) + ')\n' + (rows.length ? mdTable(['measure', 'before', 'now', 'change'],
+        rows.map(function (r) {
+          return [r.key, r1(r.before), r1(r.after), r.before !== null && r.after !== null ? sc(r.after - r.before) : '-'];
+        })) : '_no common measurements_'));
+    } else {
+      out.push('\n## Diff vs previous run\n_no previous saved run_');
+    }
+    return out.join('\n') + '\n';
+  }
+
+
   return Object.freeze({
     TOL: TOL, MANUAL_SPEC: MANUAL_SPEC,
     findOnset: findOnset, decayTime: decayTime, attackNoise: attackNoise, steadyPitch: steadyPitch, analyzeNote: analyzeNote,
     intonation: intonation, intonationFindings: intonationFindings, nut: nut, sweep: sweep, stability: stability,
-    pressure: pressure, balance: balance, manual: manual, summarize: summarize, compare: compare, fmtCents: fmtCents
+    pressure: pressure, balance: balance, manual: manual, summarize: summarize, compare: compare, fmtCents: fmtCents,
+    reportMarkdown: reportMarkdown
   });
 })();
 </script>
@@ -1249,6 +1356,7 @@ const AudioEngine = (function () {
     info: function () {
       return {
         sampleRate: ctx && ctx.sampleRate, capture: captureKind, costMs: lastCostMs, settings: trackSettings(), gateDb: gateDb(),
+        inputLabel: stream && stream.getAudioTracks()[0] ? stream.getAudioTracks()[0].label : '',
         baseLatencyMs: ctx && ctx.baseLatency ? ctx.baseLatency * 1000 : null,
         outputLatencyMs: ctx && ctx.outputLatency !== undefined ? ctx.outputLatency * 1000 : null
       };
@@ -1751,6 +1859,11 @@ const HC = GuitarHealth;
 const HC_STRING_LABELS = ['6 (low E)', '5 (A)', '4 (D)', '3 (G)', '2 (B)', '1 (high e)'];
 const HC_CAPTURE_SEC = 2.2, HC_PREROLL_SEC = 0.15, HC_TIMEOUT_SEC = 12;
 const HC_STABILITY_MIN = 10;
+const HC_MAX_SPREAD = 5;   // cents; a clean sustained pluck measures well under 1 c, a disturbed one 8+ c
+const HC_DEFAULT_GUITAR = 'Epiphone Les Paul (Tune-o-matic bridge)';
+const HC_PHOTOS = ['Front of the guitar', 'Bridge from above', 'Bridge side view, with a ruler', '12th fret side view, ruler on the low E string',
+  '12th fret side view, ruler on the high e string', 'Nut close-up', 'Pickups side view, with a ruler', 'First frets close-up',
+  'Headstock and tuners', 'Strings close-up'];
 const HC_VOICINGS = Object.freeze({   // low E -> high e, null = not played (pinky-free shapes)
   C: [null, 3, 2, 0, 1, 0], G: [3, 2, 0, 0, 0, 3], A: [null, 0, 2, 2, 2, 0], D: [null, null, 0, 2, 3, 2], E: [0, 2, 2, 1, 0, 0]
 });
@@ -1802,6 +1915,11 @@ function hcSaveError() {
   main.prepend(p);
 }
 function hcSetIn(arr, i, v) { return arr.map(function (x, j) { return j === i ? v : x; }); }
+
+function hcMeta() {
+  const info = AudioEngine.info();
+  return { guitar: hcDraft().manual.guitar || HC_DEFAULT_GUITAR, input: info.inputLabel || 'default input', sampleRate: info.sampleRate };
+}
 
 // Draft -> report object understood by GuitarHealth.summarize / compare.
 function hcBuildReport(d) {
@@ -1926,6 +2044,21 @@ function HealthScreen() {
     });
   }
 
+  // Like listen(), but asks again (up to 3 tries) when nothing or the wrong note was heard.
+  // Returns the measurement, or null after 3 failed tries / when the view changed (callers check stale()).
+  async function listenRetry(expectedMidi, prompt, my) {
+    let hint = '';
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const m = await listen(expectedMidi, hint ? hint + ' - ' + prompt : prompt);
+      if (stale(my)) return null;
+      if (m && m.found && m.matches && m.spreadCents <= HC_MAX_SPREAD) return m;
+      hint = m && m.found && !m.matches ? 'heard ' + m.name + ', expected ' + DSP.noteName(expectedMidi) + ', play it again'
+        : m && m.found ? 'pitch was unsteady, let it ring without touching other strings, play it again'
+          : 'did not hear it clearly, play it again';
+    }
+    return null;
+  }
+
   function header(title, intro) {
     return '<p><button class="back" data-go="menu">&larr; All checks</button></p><h2>' + esc(title) + '</h2>' +
       (intro ? '<p class="small muted">' + intro + '</p>' : '');
@@ -1952,7 +2085,7 @@ function HealthScreen() {
     if (id === 'stability') return !!d.stability.after;
     if (id === 'nut') return d.nut.filter(Boolean).length;
     if (id === 'intonation') return d.intonation.filter(Boolean).length;
-    if (id === 'sweep') return d.sweep.reduce(function (a, r) { return a + r.filter(Boolean).length; }, 0);
+    if (id === 'sweep') return d.sweep.reduce(function (a, r) { return a + r.filter(function (m) { return m && !m.skipped; }).length; }, 0);
     if (id === 'pressure') return d.pressure.notes.filter(Boolean).length;
     if (id === 'balance') return d.balance.filter(function (x) { return x !== null; }).length;
     return 0;
@@ -1998,6 +2131,8 @@ function HealthScreen() {
     };
     root.innerHTML = header('Manual checklist', 'No audio. Measure with a steel ruler and a feeler gauge (or a business card, about 0.25 mm). ' +
       'Typical values are factory starting points for a Les Paul-style guitar, not strict rules.') +
+      '<div class="panel"><b>Guitar</b><div class="row"><input class="num grow" type="text" maxlength="80" id="m_guitar" value="' +
+      esc(m.guitar === undefined ? HC_DEFAULT_GUITAR : m.guitar) + '"></div></div>' +
       field('stringAgeWeeks', 'String age', 'Weeks since the strings were changed. Old strings make intonation impossible to set: change them first if they are old.', 'weeks') +
       field('reliefMm', 'Neck relief', 'Capo at the 1st fret. Hold the low E down where the neck meets the body (around fret 16). ' +
         'Measure the gap between the bottom of the string and the top of the 7th fret. Typical ' + S.reliefMm.typical + '.', 'mm') +
@@ -2009,6 +2144,8 @@ function HealthScreen() {
     $(root, '#hcManualSave').addEventListener('click', function () {
       const keys = ['stringAgeWeeks', 'reliefMm', 'actionBassMm', 'actionTrebleMm', 'pickupNeckMm', 'pickupBridgeMm'];
       const vals = {};
+      const g = $(root, '#m_guitar').value.trim().slice(0, 80);
+      if (g) vals.guitar = g;
       keys.forEach(function (k) {
         const v = $(root, '#m_' + k).value.trim();
         if (v !== '' && !isNaN(Number(v)) && Number(v) >= 0) vals[k] = v;
@@ -2066,7 +2203,7 @@ function HealthScreen() {
     busy(true);
     for (let s = 0; s < 6; s++) {
       setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>Pluck it open once and let it ring.</p>');
-      const m = await listen(hcOpenMidi(s), 'pluck string ' + HC_STRING_LABELS[s] + ' open');
+      const m = await listenRetry(hcOpenMidi(s), 'pluck string ' + HC_STRING_LABELS[s] + ' open', my);
       if (stale(my)) return;
       results.push(m);
     }
@@ -2096,10 +2233,10 @@ function HealthScreen() {
       busy(true);
       for (let s = 0; s < 6; s++) {
         setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>1) open</p>');
-        const open = await listen(hcOpenMidi(s), 'pluck open');
+        const open = await listenRetry(hcOpenMidi(s), 'pluck open', my);
         if (stale(my)) return;
         setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>2) 1st fret, light pressure</p>');
-        const fret1 = await listen(hcOpenMidi(s) + 1, 'pluck at the 1st fret');
+        const fret1 = await listenRetry(hcOpenMidi(s) + 1, 'pluck at the 1st fret', my);
         if (stale(my)) return;
         const ok = open && open.found && fret1 && fret1.found && fret1.matches;
         hcSaveDraft(function (dd) { return Object.assign({}, dd, { nut: hcSetIn(dd.nut, s, ok ? { open: open, fret1: fret1 } : null) }); });
@@ -2147,11 +2284,11 @@ function HealthScreen() {
       const open = hcOpenMidi(s);
       setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>1) ' +
         (kind === 'harmonic' ? 'touch the string lightly right above the 12th fret wire and pluck (harmonic)' : 'pluck the open string') + '</p>');
-      const ref = await listen(kind === 'harmonic' ? open + 12 : open, kind === 'harmonic' ? 'play the 12th-fret harmonic' : 'pluck open');
+      const ref = await listenRetry(kind === 'harmonic' ? open + 12 : open, kind === 'harmonic' ? 'play the 12th-fret harmonic' : 'pluck open', my);
       if (stale(my)) return;
       if (!ref || !ref.found || !ref.matches) { busy(false); return; }
       setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>2) fret the 12th fret normally and pluck</p>');
-      const fretted = await listen(open + 12, 'pluck at the 12th fret');
+      const fretted = await listenRetry(open + 12, 'pluck at the 12th fret', my);
       if (stale(my)) return;
       if (!fretted || !fretted.found || !fretted.matches) { busy(false); return; }
       hcSaveDraft(function (dd) { return Object.assign({}, dd, { intonation: hcSetIn(dd.intonation, s, { ref: ref, fretted: fretted, refKind: kind }) }); });
@@ -2162,7 +2299,7 @@ function HealthScreen() {
   // ----- fret sweep -----
   function heatmap(cells, active) {
     const cw = 26, ch = 22, x0 = 34, y0 = 18;
-    const colors = { ok: 'var(--ok)', buzz: 'var(--accent)', dead: '#9b7bd6', undetected: 'var(--bad)', skipped: '#4a5260' };
+    const colors = { ok: 'var(--ok)', buzz: 'var(--accent)', dead: '#9b7bd6', undetected: 'var(--bad)', skipped: '#4a5260', untested: '#2a313b' };
     const letters = { ok: '', buzz: 'B', dead: 'D', undetected: '?', skipped: '-' };
     let svg = '<svg viewBox="0 0 ' + (x0 + 12 * cw + 4) + ' ' + (y0 + 6 * ch + 4) + '" class="heatmap" role="img" aria-label="Fret sweep heatmap">';
     for (let f = 1; f <= 12; f++) svg += '<text x="' + (x0 + (f - 0.5) * cw) + '" y="12" class="hm-t">' + f + '</text>';
@@ -2223,7 +2360,7 @@ function HealthScreen() {
       $(root, '#hcBuzz').disabled = false;
     };
     $(root, '#hcGo').addEventListener('click', listenNow);
-    $(root, '#hcSkip').addEventListener('click', function () { store(null); advance(); });
+    $(root, '#hcSkip').addEventListener('click', function () { store({ skipped: true }); advance(); });
     $(root, '#hcClean').addEventListener('click', function () { store(Object.assign({}, last, { userBuzz: false })); advance(); });
     $(root, '#hcBuzz').addEventListener('click', function () { store(Object.assign({}, last, { userBuzz: true })); advance(); });
     $(root, '#hcFrom').addEventListener('change', function () { go({ name: 'sweep', pos: { s: Number(this.value), f: 1 } }); });
@@ -2258,7 +2395,7 @@ function HealthScreen() {
       for (let s = 0; s < 6; s++) {
         if (v[s] === null) continue;
         setPrompt('<div class="big-label">' + esc(chord) + ': string ' + esc(HC_STRING_LABELS[s]) + '</div><p>keep holding, pluck this string only</p>');
-        const m = await listen(hcOpenMidi(s) + v[s], 'pluck string ' + HC_STRING_LABELS[s]);
+        const m = await listenRetry(hcOpenMidi(s) + v[s], 'pluck string ' + HC_STRING_LABELS[s], my);
         if (stale(my)) return;
         notes[s] = m && m.found && m.matches ? m : null;
       }
@@ -2284,7 +2421,7 @@ function HealthScreen() {
       busy(true);
       for (let s = 0; s < 6; s++) {
         setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>pluck open, same strength as the others</p>');
-        const m = await listen(hcOpenMidi(s), 'pluck open');
+        const m = await listenRetry(hcOpenMidi(s), 'pluck open', my);
         if (stale(my)) return;
         levels.push(m && m.found ? m.peakDb : null);
       }
@@ -2311,9 +2448,18 @@ function HealthScreen() {
       'Confidence says how much to trust the measurement, not how serious the issue is.') +
       (findings.length ? findingsHtml(findings) : '<p class="status">No checks done yet.</p>') +
       (report.sweep ? heatmap(report.sweep.cells) : '') +
-      '<button class="primary block" id="hcSave"' + (findings.length ? '' : ' disabled') + '>Save report to history</button><p class="small" id="hcStatus">&nbsp;</p>';
+      '<button class="primary block" id="hcSave"' + (findings.length ? '' : ' disabled') + '>Save report to history</button><p class="small" id="hcStatus">&nbsp;</p>' +
+      copyBlock() + photoChecklist();
+    const draftEntry = function () {
+      return { id: Date.now(), date: new Date().toISOString(), report: report, findings: findings, raw: hcDraft(), meta: hcMeta() };
+    };
+    wireCopy(function () {
+      const started = hcDraft().startedAt;
+      const earlier = (Store.load().healthReports || []).filter(function (r) { return !r.raw || r.raw.startedAt !== started; });
+      return HC.reportMarkdown(draftEntry(), earlier.length ? earlier[earlier.length - 1] : null);
+    });
     $(root, '#hcSave').addEventListener('click', function () {
-      const entry = { id: Date.now(), date: new Date().toISOString(), report: report, findings: findings };
+      const entry = draftEntry();
       const res = Store.update(function (s) {
         return Object.assign({}, s, { healthReports: (s.healthReports || []).concat([entry]).slice(-30) });
       });
@@ -2335,10 +2481,43 @@ function HealthScreen() {
           issues + ' issue(s)</span></button>';
       }).join('') + '</div>' : '<p class="status">Nothing saved yet.</p>') +
       (sel ? '<h2>Report ' + esc(new Date(sel.date).toLocaleString()) + '</h2>' + findingsHtml(sel.findings) +
-        (prev ? '<h2>Before / after</h2>' + compareTable(prev, sel) : '<p class="small muted">No earlier report to compare with.</p>') : '');
+        (prev ? '<h2>Before / after</h2>' + compareTable(prev, sel) : '<p class="small muted">No earlier report to compare with.</p>') +
+        copyBlock() + photoChecklist() : '');
+    if (sel) wireCopy(function () { return HC.reportMarkdown(sel, prev); });
     Array.prototype.forEach.call(root.querySelectorAll('[data-report]'), function (b) {
       b.addEventListener('click', function () { go({ name: 'history', id: Number(b.getAttribute('data-report')) }); });
     });
+  }
+
+  function copyBlock() {
+    return '<button class="block" id="hcCopy" style="margin-top:12px">Copy report (markdown, for a chat with Claude)</button>' +
+      '<p class="small" id="hcCopyStatus">&nbsp;</p><textarea id="hcCopyText" class="mono small" rows="10" readonly hidden></textarea>';
+  }
+
+  // Clipboard needs HTTPS/localhost and a tap; if it is refused, show the text selected for manual copy.
+  function wireCopy(makeText) {
+    $(root, '#hcCopy').addEventListener('click', async function () {
+      const text = makeText();
+      const status = $(root, '#hcCopyStatus'), area = $(root, '#hcCopyText');
+      try {
+        await navigator.clipboard.writeText(text);
+        status.innerHTML = '<span class="pill ok">copied</span> ' + text.length + ' characters. Paste it into the chat, then attach the photos below.';
+        area.hidden = true;
+      } catch (e) {
+        console.warn('Clipboard refused, showing text instead:', e);
+        area.value = text;
+        area.hidden = false;
+        area.focus();
+        area.select();
+        status.textContent = 'Copy was blocked by the browser: the text is selected below, copy it by hand.';
+      }
+    });
+  }
+
+  function photoChecklist() {
+    return '<h2>Photos to attach</h2><div class="panel"><p class="small muted">Good light, phone held square to the part. ' +
+      'For ruler shots, put the ruler on the fret/pickup and keep the scale readable.</p><ol class="small">' +
+      HC_PHOTOS.map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('') + '</ol></div>';
   }
 
   function compareTable(a, b) {

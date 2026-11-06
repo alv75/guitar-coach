@@ -7,7 +7,7 @@ const vm = require('vm');
 
 function loadBlocks() {
   const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
-  const ctx = vm.createContext({ Math, Float64Array, Float32Array, Uint32Array, Map, Set, Object, Array, Number, parseInt, isNaN, ArrayBuffer, DataView, Uint8Array });
+  const ctx = vm.createContext({ Math, Float64Array, Float32Array, Uint32Array, Map, Set, Object, Array, Number, String, Date, parseInt, isNaN, ArrayBuffer, DataView, Uint8Array });
   ['dsp-core', 'health-core'].forEach(function (id) {
     const start = html.indexOf('<script id="' + id + '">');
     const m = start < 0 ? null : /^<script id="[\w-]+">([\s\S]*?)<\/script>/.exec(html.slice(start));
