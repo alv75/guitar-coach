@@ -29,12 +29,25 @@ data of sites you have not opened for 7 days; Home Screen apps are exempt.
 - Monitor (Calibration > 7) plays the input through a simple clean amp tone. Off by default. Detection always
   reads the dry input.
 
+## Guitar Health Check
+
+Guided checks with the iRig: tuning stability, nut height, intonation (with an adjust -> retune -> re-measure
+loop), fret sweep (frets 1-12, heatmap), fretting pressure, string balance, plus a manual checklist (string age,
+relief, action, pickup height). Each finding is marked DIY or LUTHIER with a confidence level. Reports are saved
+to history for before/after comparison.
+
+Automatic: pitch (median of the steady part of each note, low-passed just above the fundamental), sustain (dead
+notes), undetected notes. Buzz is marked by you during the sweep: an automatic buzz metric was tested and did not
+work reliably (see `attackNoise` in `health-core`).
+
 ## Tests
 
 ```
-node tests/run-tests.js            # full: unit checks + synthetic accuracy + real recordings (~5-8 min)
-node tests/run-tests.js --quick    # fewer trials (~2 min)
+node tests/run-tests.js            # full: unit checks, synthetic accuracy, health check, real recordings (~15 min)
+node tests/run-tests.js --quick    # fewer trials (~5 min)
 node tests/run-tests.js --real-only
+node tests/run-tests.js --health-only
+node tests/tune-leak.js [--real]      # grid search for chord harmonic-leak suppression
 ```
 
 The tests load the `<script id="dsp-core">` block straight out of `index.html`, so they test the exact code the
@@ -48,7 +61,7 @@ from the synthetic results and groups them by source (`irig`, `phonemic`, `lapto
 
 ## Files
 
-- `index.html` - the app: styles, `dsp-core` (pitch, chroma, chord matching, trackers), `app-core` (storage,
-  wake lock, audio engine, monitor, latency test), `app-ui` (screens)
+- `index.html` - the app: styles, `dsp-core` (pitch, chroma, chord matching, trackers), `health-core` (Health Check
+  analysis), `app-core` (storage, wake lock, audio engine, monitor, latency test), `app-ui` (screens), `health-ui`
 - `tests/` - Node test harness: `synth.js` (test signals), `suite-*.js`, `run-tests.js`
 - `tests/real/` - your recordings (WAV)

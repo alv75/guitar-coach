@@ -1,7 +1,8 @@
 'use strict';
-// Usage: node tests/run-tests.js [--quick] [--fft=16384] [--sr=48000] [--real-only]
+// Usage: node tests/run-tests.js [--quick] [--fft=16384] [--sr=48000] [--real-only] [--health-only]
 const assert = require('assert');
-const { loadDsp } = require('./load-dsp');
+const { loadDsp, loadHealth } = require('./load-dsp');
+const healthSuite = require('./suite-health');
 const { readWav } = require('./wav');
 const notes = require('./suite-notes');
 const chords = require('./suite-chords');
@@ -14,8 +15,9 @@ const argVal = function (name, def) {
 };
 const QUICK = args.indexOf('--quick') >= 0;
 const REAL_ONLY = args.indexOf('--real-only') >= 0;
+const HEALTH_ONLY = args.indexOf('--health-only') >= 0;
 const SR = argVal('sr', 48000);
-const CONDITIONS = ['clean', 'room', 'harsh'];
+const CONDITIONS = ['clean', 'room', 'harsh', 'di'];
 const TARGETS = { note: 0.98, chord: 0.90 }; // on the 'room' condition (20 dB SNR)
 
 const dsp = loadDsp();
@@ -150,6 +152,11 @@ function reportChords() {
   const room = chords.summarize(v.per, 'room');
   check('chord verify accuracy on "room" >= ' + pct(TARGETS.chord), room.correct / room.n >= TARGETS.chord);
 
+  const sn = chords.runSingleNotes(dsp, { sr: SR, conditions: ['clean', 'room', 'di'], fftSize: FFT });
+  console.log('\n  Single notes played instead of a chord: ' + sn.confirmed + '/' + sn.n + ' confirmed as a chord' +
+    (sn.examples.length ? ' (' + sn.examples.join('; ') + ')' : ''));
+  check('single notes never confirm a chord', sn.confirmed === 0);
+
   heading('Chord changes: A ringing -> fingers lifted -> B strummed (time to confirm B)');
   const ch = chords.runChanges(dsp, { sr: SR, conditions: CONDITIONS, fftSize: FFT, every: QUICK ? 7 : 3 });
   const wc = [8, 6, 12, 18, 10, 16];
@@ -193,8 +200,36 @@ function reportReal() {
   }
 }
 
+function reportHealth() {
+  heading('Guitar Health Check (synthetic, iRig-style direct input)');
+  const H = loadHealth().health;
+  healthSuite.logicChecks(H, check);
+  const pa = healthSuite.pitchAccuracy(H);
+  console.log('\n  Steady pitch error over ' + pa.n + ' notes (strings x frets 0/1/5/12, +-10 c detune): median ' +
+    pa.median.toFixed(2) + ' c, p95 ' + pa.p95.toFixed(2) + ' c, max ' + pa.max.toFixed(2) + ' c');
+  check('steady pitch p95 error < 1.5 cents', pa.p95 < 1.5);
+  const ic = healthSuite.intonationCases(H);
+  console.log('  Intonation (true offset -> measured, status): ' + ic.map(function (c) {
+    return (c.truth > 0 ? '+' : '') + c.truth + '->' + c.measured.toFixed(1) + ' ' + c.status; }).join(' | '));
+  check('intonation status correct on all cases', ic.every(function (c) {
+    return c.status === (Math.abs(c.truth) <= 5 ? 'ok' : c.truth > 0 ? 'sharp' : 'flat'); }));
+  console.log('\n  Fret sweep, 72 notes, 3 buzzing (marked by player) + 2 dead notes, varying buzz loudness:');
+  const w = [14, 12, 14, 12, 14, 12];
+  console.log('  ' + row(['buzz amount', 'buzz found', 'false buzz', 'dead found', 'false dead', 'undetected'], w));
+  const sweeps = [0.02, 0.05, 0.1, 0.2].map(function (a, i) { return healthSuite.sweepCase(H, a, 5000 + i * 1000); });
+  sweeps.forEach(function (r) {
+    console.log('  ' + row([r.buzzAmount, r.buzzHit + '/3', r.buzzFalse + '/69', r.deadHit + '/2', r.deadFalse + '/70', r.undetected], w));
+  });
+  check('sweep: no false buzz/dead flags and dead notes found at all buzz levels',
+    sweeps.every(function (r) { return r.buzzFalse === 0 && r.deadFalse === 0 && r.deadHit === 2 && r.undetected === 0; }));
+  check('sweep: player-marked buzz kept (3/3), buzzing notes still measured', sweeps.every(function (r) { return r.buzzHit === 3; }));
+}
+
 const t0 = Date.now();
-if (!REAL_ONLY) { unitChecks(); reportNotes(); reportSequences(); reportChords(); }
-reportReal();
+if (HEALTH_ONLY) reportHealth();
+else {
+  if (!REAL_ONLY) { unitChecks(); reportNotes(); reportSequences(); reportChords(); reportHealth(); }
+  reportReal();
+}
 console.log('\nDone in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s. ' + (failures ? failures + ' check(s) FAILED.' : 'All checks passed.'));
 process.exitCode = failures ? 1 : 0;

@@ -5,7 +5,7 @@ const { noiseFloorDb, streamFrames, trackEvents } = require('./stream');
 // Keeps only what the trackers need, so margin sweeps don't recompute FFTs.
 function slim(frames) {
   return frames.map(function (f) {
-    return { t: f.t, frame: { levelDb: f.frame.levelDb, voiced: f.frame.voiced, lib: f.frame.lib, all: f.frame.all } };
+    return { t: f.t, frame: { levelDb: f.frame.levelDb, voiced: f.frame.voiced, chroma: f.frame.chroma, lib: f.frame.lib, all: f.frame.all } };
   });
 }
 
@@ -108,4 +108,25 @@ function runChanges(dsp, opts) {
   return out;
 }
 
-module.exports = { buildChordCases, evaluate, summarize, frameAccuracy, sweepMargins, runChanges };
+// Single notes (open strings and frets 3/7, every string) must never confirm a chord.
+function runSingleNotes(dsp, opts) {
+  let n = 0, confirmed = 0;
+  const examples = [];
+  opts.conditions.forEach(function (cond, ci) {
+    synth.OPEN_STRINGS.forEach(function (open, s) {
+      [0, 3, 7].forEach(function (f) {
+        const x = synth.renderPluck(open + f, 0, { sr: opts.sr, seed: 81000 + ci * 100 + s * 10 + f, condition: cond, duration: 1.8, onset: 0.3 });
+        const gate = noiseFloorDb(dsp, x, opts.sr, 0.25) + dsp.CONFIG.gateOffsetDb;
+        const frames = streamFrames(dsp, x, opts.sr, { gateDb: gate, pitch: false, chroma: { fftSize: opts.fftSize } });
+        ['verify', 'identify'].forEach(function (mode) {
+          const ev = trackEvents(dsp, frames, function (fr) { return dsp.chordLabel(fr, mode); }, dsp.CONFIG.chordStableSec, gate);
+          n++;
+          if (ev.length) { confirmed++; if (examples.length < 5) examples.push(cond + ' ' + dsp.noteName(open + f) + ' -> ' + ev[0].label); }
+        });
+      });
+    });
+  });
+  return { n: n, confirmed: confirmed, examples: examples };
+}
+
+module.exports = { buildChordCases, evaluate, summarize, frameAccuracy, sweepMargins, runChanges, runSingleNotes };

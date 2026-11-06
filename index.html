@@ -88,6 +88,18 @@ td, th { padding: 6px 4px; text-align: left; border-bottom: 1px solid var(--line
 .big-label { font-size: 44px; font-weight: 800; }
 .rec-list a { margin: 4px 6px 4px 0; }
 input[type=range] { width: 100%; height: 36px; }
+
+/* health check */
+.hc-prompt { text-align: center; }
+.hc-prompt .big-label { font-size: 30px; }
+.heatmap { width: 100%; max-width: 420px; display: block; margin: 8px auto 0; }
+.hm-t { fill: var(--muted); font-size: 11px; text-anchor: middle; }
+.hm-l { fill: #111; font-size: 12px; font-weight: 700; text-anchor: middle; }
+.finding.major { border-left: 5px solid var(--bad); }
+.finding.minor { border-left: 5px solid var(--warn); }
+.finding.ok { border-left: 5px solid var(--ok); }
+input.num { min-height: var(--tap); width: 120px; font: inherit; padding: 0 12px; border-radius: 12px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--text); }
 </style>
 </head>
 <body>
@@ -112,12 +124,14 @@ var GuitarDSP = (function () {
     yin: Object.freeze({ windowSec: 0.04, threshold: 0.15, minFreq: 75, maxFreq: 1400 }),
     chroma: Object.freeze({
       fftSize: 16384, fMin: 70, fMax: 1200, harmonics: 4, harmonicDecay: 0.8,
-      maxHarmonicFreq: 5000, peakCents: 25, floorRemoval: 0.5
+      maxHarmonicFreq: 5000, peakCents: 25, floorRemoval: 0.5,
+      leak: Object.freeze({ h3: 0.15, h5: 0.3, h7: 0.15 })   // harmonic-leak suppression, tuned by tests/tune-leak.js
     }),
     noteStableSec: 0.08,
     chordStableSec: 0.3,
     verifyMargin: 0.03,        // tuned by the margin sweep in tests/run-tests.js
     identifyMargin: 0.02,
+    minThirdPc: 0.33,          // a chord needs a 3rd pitch class >= 33 % of the strongest (single notes stay below ~0.31)
     onsetRiseDb: 6,
     gateOffsetDb: 6            // gate = measured noise floor + this
   });
@@ -258,6 +272,35 @@ var GuitarDSP = (function () {
     return { freq: sr / refined, clarity: 1 - b };
   }
 
+  // Two cascaded 2nd-order low-pass sections (Butterworth). Returns a new Float32Array.
+  function lowpass(x, sr, fc) {
+    const w = 2 * Math.PI * fc / sr, alpha = Math.sin(w) / (2 * Math.SQRT1_2), cw = Math.cos(w);
+    const a0 = 1 + alpha;
+    const b0 = (1 - cw) / 2 / a0, b1 = (1 - cw) / a0, b2 = b0, a1 = -2 * cw / a0, a2 = (1 - alpha) / a0;
+    let y = Float32Array.from(x);
+    for (let pass = 0; pass < 2; pass++) {
+      const out = new Float32Array(y.length);
+      let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+      for (let i = 0; i < y.length; i++) {
+        const v = b0 * y[i] + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = y[i]; y2 = y1; y1 = v; out[i] = v;
+      }
+      y = out;
+    }
+    return y;
+  }
+
+  // Two-pass pitch: YIN estimate, then YIN again on the signal low-passed at 1.4x that estimate.
+  // On bright direct input the slightly sharp upper partials of a real string bias a single YIN pass by several cents.
+  function refinedPitch(buf, sr) {
+    const p = yin(buf, sr);
+    if (!p) return null;
+    const need = Math.round(CONFIG.yin.windowSec * sr) + Math.ceil(sr / CONFIG.yin.minFreq) + 2 + Math.round(0.05 * sr);
+    const seg = buf.length > need ? buf.subarray(buf.length - need) : buf;
+    const q = yin(lowpass(seg, sr, Math.min(1.4 * p.freq, 0.45 * sr)), sr);
+    return q && Math.abs(1200 * Math.log2(q.freq / p.freq)) < 50 ? { freq: q.freq, clarity: p.clarity } : p;
+  }
+
   // ---------- chroma ----------
   // Harmonic-summation pitch salience folded into 12 pitch classes (index 0 = C).
   function chromaFromSpectrum(mag, sr, n, opts) {
@@ -287,9 +330,29 @@ var GuitarDSP = (function () {
     // remove a fraction of the median salience (broadband noise floor)
     const sorted = sal.map(function (x) { return x.s; }).sort(function (a, b) { return a - b; });
     const floor = sorted[Math.floor(sorted.length / 2)] * o.floorRemoval;
+    const clean = suppressHarmonicLeaks(sal.map(function (x) { return Math.max(0, x.s - floor); }), o.leak);
     const chroma = new Float64Array(12);
-    sal.forEach(function (x) { chroma[x.midi % 12] += Math.max(0, x.s - floor); });
+    sal.forEach(function (x, i) { chroma[x.midi % 12] += clean[i]; });
     return chroma;
+  }
+
+  // Non-octave overtones of a low note show up as salience at other pitch classes:
+  // 3rd harmonic = fifth (+19 semitones), 5th = major third (+28, 14 c flat), 7th = flat seventh (+34, 31 c flat).
+  // The 5th harmonic of a minor chord's root is its MAJOR third, which flips minor to major on bright direct input.
+  // Walking low -> high, subtract the share predicted from the (already cleaned) lower note. Octave harmonics fold
+  // into the same pitch class and are left alone. Returns a new array.
+  const LEAK_STEPS = Object.freeze([['h3', 19], ['h5', 28], ['h7', 34]]);
+  function suppressHarmonicLeaks(sal, leak) {
+    const out = [];
+    for (let i = 0; i < sal.length; i++) {
+      let predicted = 0;
+      LEAK_STEPS.forEach(function (step) {
+        const j = i - step[1];
+        if (j >= 0 && leak[step[0]]) predicted += leak[step[0]] * out[j];
+      });
+      out.push(Math.max(0, sal[i] - predicted));
+    }
+    return out;
   }
 
   function chromaOf(buf, sr, opts) {
@@ -346,7 +409,7 @@ var GuitarDSP = (function () {
     const frame = { levelDb: levelDb, voiced: voiced, pitch: null, chroma: null, lib: null, all: null };
     if (!voiced) return frame;
     if (o.pitch !== false) {
-      const p = yin(buf, sr);
+      const p = refinedPitch(buf, sr);
       frame.pitch = p ? Object.assign({}, p, freqToNote(p.freq, o.a4)) : null;
     }
     if (o.chords !== false) {
@@ -377,10 +440,17 @@ var GuitarDSP = (function () {
 
   // Frame -> chord label for the tracker (null = no confident chord).
   function chordLabel(frame, mode, margin) {
-    if (!frame.voiced || !frame.lib) return null;
+    if (!frame.voiced || !frame.lib || !hasThreePitchClasses(frame.chroma)) return null;
     const ranked = mode === 'identify' ? frame.all : frame.lib;
     const m = margin === undefined ? (mode === 'identify' ? CONFIG.identifyMargin : CONFIG.verifyMargin) : margin;
     return ranked[0].score - ranked[1].score >= m ? ranked[0].id : null;
+  }
+
+  // Rejects single notes (and power chords): their overtones give at most two strong pitch classes.
+  function hasThreePitchClasses(chroma) {
+    if (!chroma) return true;                  // trackers in tests may carry rankings only
+    const v = Array.prototype.slice.call(chroma).sort(function (a, b) { return b - a; });
+    return v[0] > 0 && v[2] / v[0] >= CONFIG.minThirdPc;
   }
 
   function noteLabel(frame) {
@@ -414,10 +484,411 @@ var GuitarDSP = (function () {
     NOTE_NAMES: NOTE_NAMES, CONFIG: CONFIG, STRINGS: STRINGS, LIBRARY: LIBRARY, ALL_CHORDS: ALL_CHORDS, TEMPLATES: TEMPLATES,
     midiToFreq: midiToFreq, noteName: noteName, freqToNote: freqToNote, parseNoteName: parseNoteName,
     rms: rms, toDb: toDb, nearestString: nearestString,
-    magnitudeSpectrum: magnitudeSpectrum, yin: yin, chromaFromSpectrum: chromaFromSpectrum, chromaOf: chromaOf,
+    magnitudeSpectrum: magnitudeSpectrum, yin: yin, lowpass: lowpass, refinedPitch: refinedPitch, chromaFromSpectrum: chromaFromSpectrum, chromaOf: chromaOf,
     cosine: cosine, rankChords: rankChords, verifyChord: verifyChord,
     analyzeFrame: analyzeFrame, initTracker: initTracker, stepTracker: stepTracker,
     chordLabel: chordLabel, noteLabel: noteLabel, isOnset: isOnset
+  });
+})();
+</script>
+
+<!-- ===================== HEALTH CORE (pure analysis for the Guitar Health Check; also loaded by tests) ===================== -->
+<script id="health-core">
+var GuitarHealth = (function () {
+  'use strict';
+  const DSP = GuitarDSP;
+
+  const TOL = Object.freeze({
+    intonationCents: 5,      // 12th fret vs open/harmonic
+    nutSharpCents: 8,        // 1st fret vs open
+    driftCents: 5,           // tuning stability
+    pressureSharpCents: 8,   // fretted notes in a held chord vs open-string reference
+    balanceDb: 6,            // string level vs median
+    deadRatio: 0.5           // sustain < 50 % of same-string neighbours
+  });
+
+  // ---------- measurement primitives ----------
+  // First 5 ms window above gate; returns seconds or null.
+  function findOnset(x, sr, gateDb) {
+    const w = Math.max(64, Math.round(0.005 * sr));
+    for (let i = 0; i + w <= x.length; i += w) {
+      if (DSP.toDb(DSP.rms(x, i, i + w)) > gateDb) return i / sr;
+    }
+    return null;
+  }
+
+  function median(xs) {
+    if (!xs.length) return null;
+    const s = xs.slice().sort(function (a, b) { return a - b; });
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+
+  function mad(xs) {
+    const m = median(xs);
+    return median(xs.map(function (v) { return Math.abs(v - m); }));
+  }
+
+  // Sustain: seconds from the attack peak until the level has fallen 20 dB (capped at the capture end).
+  function decayTime(x, sr, onsetSec) {
+    const w = Math.round(0.02 * sr);
+    const start = Math.round(onsetSec * sr);
+    let peak = -200, peakIdx = start;
+    for (let i = start; i + w <= Math.min(x.length, start + Math.round(0.3 * sr)); i += w) {
+      const db = DSP.toDb(DSP.rms(x, i, i + w));
+      if (db > peak) { peak = db; peakIdx = i; }
+    }
+    for (let i = peakIdx; i + w <= x.length; i += w) {
+      if (DSP.toDb(DSP.rms(x, i, i + w)) < peak - 20) return { peakDb: peak, decaySec: (i - peakIdx) / sr, capped: false };
+    }
+    return { peakDb: peak, decaySec: (x.length - peakIdx) / sr, capped: true };
+  }
+
+  // EXPERIMENTAL, logged only (not used for any flag): attack brightness excess (dB) = high band (3-8 kHz) vs
+  // low band (60-1500 Hz) in the attack, minus the same ratio 0.6 s later. Synthetic tests showed it does NOT
+  // separate buzz from normal fast decay of high partials, so buzz is marked by the player during the sweep.
+  // Kept so real recordings of known buzzing frets can be evaluated later.
+  function bandPow(mag, binHz, lo, hi) {
+    let s = 0;
+    for (let k = Math.ceil(lo / binHz); k <= Math.min(mag.length - 1, Math.floor(hi / binHz)); k++) s += mag[k] * mag[k];
+    return s + 1e-20;
+  }
+  function attackNoise(x, sr, onsetSec) {
+    const n = 4096, binHz = sr / n;
+    const ratioAt = function (startSec) {
+      const end = Math.round(startSec * sr) + n;
+      if (end > x.length) return null;
+      const mag = DSP.magnitudeSpectrum(x.subarray(end - n, end), n);
+      return 10 * Math.log10(bandPow(mag, binHz, 3000, 8000) / bandPow(mag, binHz, 60, 1500));
+    };
+    const a = ratioAt(onsetSec + 0.02), b = ratioAt(onsetSec + 0.6);
+    return a === null || b === null ? null : a - b;
+  }
+
+
+
+  // Median pitch over the steady part (0.25-1.2 s after onset by default). The first ~200 ms of a pluck is sharp.
+  function steadyPitch(x, sr, onsetSec, from, to) {
+    const a = onsetSec + (from === undefined ? 0.25 : from), b = onsetSec + (to === undefined ? 1.2 : to);
+    const hop = Math.round(0.02 * sr), span = 4096;
+    const freqs = [], clar = [];
+    for (let i = Math.round(a * sr); i <= Math.min(x.length, Math.round(b * sr)); i += hop) {
+      if (i - span < 0) continue;
+      const p = DSP.yin(x.subarray(i - span, i), sr);
+      if (p && p.clarity > 0.85) { freqs.push(p.freq); clar.push(p.clarity); }
+    }
+    if (freqs.length < 5) return null;
+    const cents = freqs.map(function (f) { return 1200 * Math.log2(f / freqs[0]); });
+    const medFreq = freqs[0] * Math.pow(2, median(cents) / 1200);
+    return { freq: medFreq, spreadCents: mad(cents) * 1.4826, frames: freqs.length, clarity: median(clar) };
+  }
+
+  // Full analysis of one captured pluck. expectedMidi optional.
+  // When the note is known, everything above ~1.4x its fundamental is filtered out before measuring pitch:
+  // on bright direct input the slightly sharp upper partials of a real string otherwise bias the period estimate.
+  // onsetSec (optional): attack position already known by the caller (live capture); otherwise first gate crossing.
+  function analyzeNote(x, sr, gateDb, expectedMidi, onsetSec) {
+    const onset = onsetSec === undefined ? findOnset(x, sr, gateDb) : onsetSec;
+    if (onset === null) return { found: false, reason: 'no note heard' };
+    const pitchSrc = expectedMidi === undefined ? x : DSP.lowpass(x, sr, Math.min(1.4 * DSP.midiToFreq(expectedMidi), 0.45 * sr));
+    const p = steadyPitch(pitchSrc, sr, onset);
+    const d = decayTime(x, sr, onset);
+    if (!p) return { found: false, reason: 'no stable pitch', onsetSec: onset, peakDb: d.peakDb, decaySec: d.decaySec };
+    const note = DSP.freqToNote(p.freq);
+    const ref = expectedMidi === undefined ? note.midi : expectedMidi;
+    const centsVsRef = 1200 * Math.log2(p.freq / DSP.midiToFreq(ref));
+    return {
+      found: true, onsetSec: onset, freq: p.freq, midi: note.midi, name: note.name,
+      cents: centsVsRef, matches: expectedMidi === undefined || note.midi === expectedMidi,
+      spreadCents: p.spreadCents, clarity: p.clarity, peakDb: d.peakDb, decaySec: d.decaySec, decayCapped: d.capped,
+      noise: attackNoise(x, sr, onset)
+    };
+  }
+
+  function confidenceFromSpread(spread) { return spread < 2 ? 'high' : spread < 5 ? 'medium' : 'low'; }
+
+  function finding(check, severity, who, confidence, title, detail, fix) {
+    return { check: check, severity: severity, who: who, confidence: confidence, title: title, detail: detail, fix: fix };
+  }
+
+  // ---------- 1. intonation ----------
+  // ref: measurement of open string or 12th-fret harmonic; fretted: 12th fret. Both are analyzeNote results.
+  function intonation(stringIdx, ref, fretted, refKind) {
+    const target = ref.freq * (refKind === 'harmonic' ? 1 : 2);
+    const offset = 1200 * Math.log2(fretted.freq / target);
+    const status = Math.abs(offset) <= TOL.intonationCents ? 'ok' : offset > 0 ? 'sharp' : 'flat';
+    const advice = status === 'ok' ? 'In tolerance.'
+      : status === 'sharp'
+        ? 'Fretted note is sharp: move this saddle AWAY from the neck (toward the tailpiece).'
+        : 'Fretted note is flat: move this saddle TOWARD the neck.';
+    return {
+      string: stringIdx, offsetCents: offset, status: status, advice: advice,
+      confidence: confidenceFromSpread(Math.max(ref.spreadCents, fretted.spreadCents))
+    };
+  }
+
+  function intonationFindings(results) {
+    const bad = results.filter(function (r) { return r && r.status !== 'ok'; });
+    if (!results.filter(Boolean).length) return [];
+    if (!bad.length) return [finding('intonation', 'ok', 'DIY', 'high', 'Intonation within +-5 cents on all measured strings', '', '')];
+    return bad.map(function (r) {
+      return finding('intonation', Math.abs(r.offsetCents) > 15 ? 'major' : 'minor', 'DIY', r.confidence,
+        'Intonation off on string ' + DSP.STRINGS[r.string].label + ': ' + fmtCents(r.offsetCents),
+        r.advice,
+        'Loosen the string a little, move the saddle in small steps (a quarter to half turn of the screw), retune, re-measure. ' +
+        'Do this with fresh strings and after action/relief are set. If the saddle runs out of travel, a luthier can flip the saddle or move the bridge.');
+    });
+  }
+
+  // ---------- 2. nut height ----------
+  // perString: [{ open: analyzeNote, fret1: analyzeNote }] ; 1st fret should be exactly +100 c above open.
+  function nut(perString) {
+    const rows = perString.map(function (p, i) {
+      if (!p || !p.open || !p.fret1) return null;
+      return { string: i, sharpCents: 1200 * Math.log2(p.fret1.freq / p.open.freq) - 100, spread: Math.max(p.open.spreadCents, p.fret1.spreadCents) };
+    });
+    const valid = rows.filter(Boolean);
+    const high = valid.filter(function (r) { return r.sharpCents > TOL.nutSharpCents; });
+    const med = median(valid.map(function (r) { return r.sharpCents; }));
+    let f = [];
+    if (valid.length >= 3 && high.length >= Math.ceil(valid.length / 2)) {
+      f = [finding('nut', 'major', 'LUTHIER', valid.length >= 5 ? 'medium' : 'low',
+        'Nut slots likely too high (1st fret notes sharp by ~' + Math.round(med) + ' c on ' + high.length + '/' + valid.length + ' strings)',
+        'Chords near the nut will sound out of tune even when the open strings are in tune.',
+        'A luthier can lower the nut slots (cheap job, but filing too deep ruins the nut).')];
+    } else if (high.length) {
+      f = high.map(function (r) {
+        return finding('nut', 'minor', 'LUTHIER', 'low', 'String ' + DSP.STRINGS[r.string].label + ' 1st fret sharp ' + fmtCents(r.sharpCents),
+          'Single string: could be that nut slot, or pressing hard near the nut. Re-test with a light touch first.', 'If it repeats, ask a luthier to check that nut slot.');
+      });
+    } else if (valid.length) {
+      f = [finding('nut', 'ok', 'LUTHIER', 'medium', 'Nut height looks fine (1st fret median ' + fmtCents(med) + ')', '', '')];
+    }
+    return { rows: rows, medianSharp: med, findings: f };
+  }
+
+  // ---------- 3. fret sweep ----------
+  // grid[string][fret-1] = analyzeNote result + { userBuzz } (or null = skipped), frets 1..12.
+  // Dead / undetected are automatic; buzz comes from the player's ear (see attackNoise note).
+  function sweep(grid) {
+    const cells = grid.map(function (row) {
+      return row.map(function (m, f) {
+        if (m === null || m === undefined) return { status: 'skipped' };
+        if (!m.found || !m.matches) return { status: 'undetected', heard: m.found ? m.name : null };
+        const neighbours = row.slice(Math.max(0, f - 2), f + 3)
+          .filter(function (n) { return n && n.found && n.matches && n !== m; })
+          .map(function (n) { return n.decaySec; });
+        const nbMed = median(neighbours);
+        const dead = nbMed !== null && !m.decayCapped && m.decaySec < TOL.deadRatio * nbMed;
+        return { status: m.userBuzz ? 'buzz' : dead ? 'dead' : 'ok', noise: m.noise, decaySec: m.decaySec, cents: m.cents };
+      });
+    });
+    return { cells: cells, findings: sweepFindings(cells) };
+  }
+
+  function sweepFindings(cells) {
+    const list = [];
+    cells.forEach(function (row, s) { row.forEach(function (c, f) { list.push({ s: s, fret: f + 1, c: c }); }); });
+    const tested = list.filter(function (x) { return x.c.status !== 'skipped'; });
+    if (!tested.length) return [];
+    const buzz = list.filter(function (x) { return x.c.status === 'buzz'; });
+    const dead = list.filter(function (x) { return x.c.status === 'dead'; });
+    const und = list.filter(function (x) { return x.c.status === 'undetected'; });
+    const out = [];
+    const name = function (x) { return 'string ' + (6 - x.s) + ' fret ' + x.fret; };   // s: 0 = low E = string 6
+    if (buzz.length) {
+      const lowFrets = buzz.filter(function (x) { return x.fret <= 5; });
+      const strings = new Set(buzz.map(function (x) { return x.s; }));
+      const fretsHit = {};
+      buzz.forEach(function (x) { fretsHit[x.fret] = (fretsHit[x.fret] || 0) + 1; });
+      const sameFret = Object.keys(fretsHit).filter(function (k) { return fretsHit[k] >= 2; });
+      let cause, fix, who;
+      if (lowFrets.length >= 3 && strings.size >= 3) {
+        cause = 'Buzz clustered on the low frets across several strings: usually too little neck relief (or a low nut).';
+        fix = 'Check relief (manual checklist). A slight truss-rod loosening (1/8 turn at a time) is DIY if you are comfortable; otherwise a luthier.';
+        who = 'DIY';
+      } else if (sameFret.length) {
+        cause = 'Several strings buzz at the same fret(s) ' + sameFret.join(', ') + ': often one fret sitting high (the buzz happens on the fret BELOW the high one).';
+        fix = 'Fret levelling / seating is luthier work.';
+        who = 'LUTHIER';
+      } else if (strings.size === 1 && buzz.length >= 4) {
+        cause = 'Buzz along one string: action on that side of the bridge is probably low.';
+        fix = 'Raise that side of the Tune-o-matic a little with its thumbwheel, then re-test.';
+        who = 'DIY';
+      } else {
+        cause = 'Isolated buzz spots. Re-test them with a firm pick attack; consistent spots usually mean an uneven fret.';
+        fix = 'If they repeat, a luthier can level the frets.';
+        who = 'LUTHIER';
+      }
+      out.push(finding('buzz', buzz.length >= 6 ? 'major' : 'minor', who, 'medium',
+        'Buzz you marked at ' + buzz.length + ' position(s): ' + buzz.map(name).join(', '), cause, fix));
+    }
+    if (dead.length) {
+      out.push(finding('dead', 'minor', 'LUTHIER', 'medium',
+        'Short sustain (dead spot?) at ' + dead.map(name).join(', '),
+        'Sustain under half of the neighbouring frets. Dead spots are often a neck resonance (normal on many guitars); a loose or high fret is also possible.',
+        'Only worth a luthier visit if it bothers you or it comes with buzz.'));
+    }
+    if (und.length) {
+      out.push(finding('undetected', 'minor', 'DIY', 'medium', 'Notes not detected at ' + und.map(name).join(', '),
+        'Either the note did not ring (fretting, muting, heavy buzz) or the app heard another note.', 'Re-test those positions.'));
+    }
+    if (!out.length) out.push(finding('buzz', 'ok', 'DIY', 'medium', 'No buzz or dead notes found on ' + tested.length + ' positions', '', ''));
+    return out;
+  }
+
+  // ---------- 4. tuning stability ----------
+  // before/after: arrays of 6 analyzeNote results (open strings) or null.
+  function stability(before, after, minutes) {
+    const rows = before.map(function (b, i) {
+      const a = after[i];
+      if (!b || !a || !b.found || !a.found) return null;
+      return { string: i, driftCents: 1200 * Math.log2(a.freq / b.freq) };
+    });
+    const valid = rows.filter(Boolean);
+    const moved = valid.filter(function (r) { return Math.abs(r.driftCents) > TOL.driftCents; });
+    let f;
+    if (!valid.length) f = [];
+    else if (!moved.length) {
+      f = [finding('stability', 'ok', 'DIY', 'high', 'Tuning stable after ' + Math.round(minutes) + ' min (max drift ' +
+        fmtCents(valid.reduce(function (m, r) { return Math.abs(r.driftCents) > Math.abs(m) ? r.driftCents : m; }, 0)) + ')', '', '')];
+    } else {
+      const allFlat = moved.length >= 4 && moved.every(function (r) { return r.driftCents < 0; });
+      f = [finding('stability', 'minor', 'DIY', 'high',
+        'Tuning drifted on ' + moved.map(function (r) { return DSP.STRINGS[r.string].name + ' ' + fmtCents(r.driftCents); }).join(', '),
+        allFlat ? 'Most strings went flat together: typical of new strings still stretching, or a temperature change.'
+          : 'Single strings slipping: string not settled at the tuner post, a slipping tuner, or binding in the nut (pings when tuning).',
+        allFlat ? 'Stretch the strings gently, retune, repeat until they hold.'
+          : 'Check the winds on the tuner post, put pencil graphite in the nut slot. If one string keeps slipping, the tuner may need replacing (DIY or luthier).')];
+    }
+    return { rows: rows, minutes: minutes, findings: f };
+  }
+
+  // ---------- 5. pressure ----------
+  // perString: [{ fretted: bool, m: analyzeNote with expectedMidi }] for the strings of the held chord.
+  function pressure(perString, openRef) {
+    const rows = perString.map(function (p, i) {
+      if (!p || !p.m || !p.m.found) return null;
+      const refOffset = openRef && openRef[i] && openRef[i].found ? openRef[i].cents : 0;
+      return { string: i, fretted: p.fretted, cents: p.m.cents - refOffset };
+    }).filter(Boolean);
+    const fr = rows.filter(function (r) { return r.fretted; });
+    const med = median(fr.map(function (r) { return r.cents; }));
+    let f = [];
+    if (fr.length >= 2 && med > TOL.pressureSharpCents) {
+      f = [finding('pressure', 'minor', 'DIY', 'medium', 'Fretted notes sharp by ~' + Math.round(med) + ' c while holding the chord',
+        'Pressing too hard (or pulling the string sideways) bends the note sharp.',
+        'Press just behind the fret with the lightest pressure that still rings clean. Re-test to see the cents drop.')];
+    } else if (fr.length >= 2) {
+      f = [finding('pressure', 'ok', 'DIY', 'medium', 'Fretting pressure fine (fretted notes median ' + fmtCents(med) + ')', '', '')];
+    }
+    return { rows: rows, medianFretted: med, findings: f };
+  }
+
+  // ---------- 6. string balance ----------
+  function balance(levels) {
+    const valid = levels.map(function (l, i) { return l === null || l === undefined ? null : { string: i, db: l }; }).filter(Boolean);
+    const med = median(valid.map(function (r) { return r.db; }));
+    const rows = valid.map(function (r) { return { string: r.string, relDb: r.db - med }; });
+    const off = rows.filter(function (r) { return Math.abs(r.relDb) > TOL.balanceDb; });
+    let f = [];
+    if (valid.length >= 4) {
+      f = off.length
+        ? [finding('balance', 'minor', 'DIY', 'low', 'Uneven string levels: ' + off.map(function (r) { return DSP.STRINGS[r.string].name + ' ' + (r.relDb > 0 ? '+' : '') + r.relDb.toFixed(1) + ' dB'; }).join(', '),
+          'Low confidence: picking strength varies a lot. Repeat a few times before adjusting.',
+          'Adjust pickup height or the pole screw under a weak/strong string in small steps.')]
+        : [finding('balance', 'ok', 'DIY', 'low', 'String levels balanced within +-' + TOL.balanceDb + ' dB', '', '')];
+    }
+    return { rows: rows, findings: f };
+  }
+
+  // ---------- manual checklist ----------
+  // Typical starting points for a Les Paul-style guitar (not absolute rules).
+  const MANUAL_SPEC = Object.freeze({
+    actionBassMm: { lo: 1.4, hi: 2.4, typical: '1.6-2.0 mm (about 4/64")' },
+    actionTrebleMm: { lo: 1.0, hi: 2.0, typical: '1.2-1.6 mm (about 3/64")' },
+    reliefMm: { lo: 0.1, hi: 0.4, typical: '0.2-0.3 mm (about 0.010")' },
+    stringAgeWeeks: { hi: 12 },
+    pickupNeckMm: { lo: 1.6, hi: 3.2, typical: 'about 2.4 mm (3/32") bass side' },
+    pickupBridgeMm: { lo: 1.2, hi: 2.4, typical: 'about 1.6 mm (1/16")' }
+  });
+
+  function num(v) { const n = Number(v); return v === '' || v === null || v === undefined || isNaN(n) ? null : n; }
+
+  function manual(m) {
+    const out = [];
+    const S = MANUAL_SPEC;
+    const range = function (key, label, val, lowFix, highFix, whoLow, whoHigh) {
+      const v = num(val), s = S[key];
+      if (v === null) return;
+      if (v < s.lo) out.push(finding('manual', 'minor', whoLow, 'medium', label + ' low: ' + v + ' mm (typical ' + s.typical + ')', '', lowFix));
+      else if (v > s.hi) out.push(finding('manual', 'minor', whoHigh, 'medium', label + ' high: ' + v + ' mm (typical ' + s.typical + ')', '', highFix));
+      else out.push(finding('manual', 'ok', whoHigh, 'medium', label + ' OK: ' + v + ' mm', '', ''));
+    };
+    range('reliefMm', 'Neck relief', m.reliefMm,
+      'Too straight (or back-bowed) causes buzz on low frets: loosen the truss rod 1/8 turn at a time, wait, re-measure.',
+      'Too much bow raises action in the middle of the neck: tighten the truss rod 1/8 turn at a time. Never force it; if it is stiff, stop and see a luthier.',
+      'DIY', 'DIY');
+    range('actionBassMm', 'Action at 12th fret, low E', m.actionBassMm,
+      'Raise the bass side of the bridge with its thumbwheel.', 'Lower the bass side thumbwheel (set relief first).', 'DIY', 'DIY');
+    range('actionTrebleMm', 'Action at 12th fret, high e', m.actionTrebleMm,
+      'Raise the treble side of the bridge with its thumbwheel.', 'Lower the treble side thumbwheel (set relief first).', 'DIY', 'DIY');
+    range('pickupNeckMm', 'Neck pickup height', m.pickupNeckMm, 'Lower is fine for tone; raise slightly for more output.', 'Too close can pull the strings out of tune: lower it.', 'DIY', 'DIY');
+    range('pickupBridgeMm', 'Bridge pickup height', m.pickupBridgeMm, 'Raise slightly for more output.', 'Too close can pull the strings out of tune: lower it.', 'DIY', 'DIY');
+    const age = num(m.stringAgeWeeks);
+    if (age !== null) {
+      out.push(age > S.stringAgeWeeks.hi
+        ? finding('manual', 'minor', 'DIY', 'high', 'Strings are ' + age + ' weeks old', 'Old strings sound dull, go out of tune and make intonation impossible to set.', 'Change strings BEFORE adjusting intonation.')
+        : finding('manual', 'ok', 'DIY', 'high', 'Strings ' + age + ' weeks old', '', ''));
+    }
+    return out;
+  }
+
+  // ---------- summary + compare ----------
+  const SEVERITY_ORDER = { major: 0, minor: 1, ok: 2 };
+  function summarize(report) {
+    const all = [].concat(
+      report.intonation ? intonationFindings(report.intonation) : [],
+      report.nut ? report.nut.findings : [],
+      report.sweep ? report.sweep.findings : [],
+      report.stability ? report.stability.findings : [],
+      report.pressure ? report.pressure.findings : [],
+      report.balance ? report.balance.findings : [],
+      report.manual ? manual(report.manual) : []
+    );
+    return all.slice().sort(function (a, b) { return SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]; });
+  }
+
+  // Key numbers per check, for before/after comparison.
+  function keyNumbers(report) {
+    const k = {};
+    if (report.intonation) report.intonation.forEach(function (r) { if (r) k['Intonation ' + DSP.STRINGS[r.string].name] = r.offsetCents; });
+    if (report.nut && report.nut.medianSharp !== null) k['Nut: 1st fret median'] = report.nut.medianSharp;
+    if (report.sweep) {
+      const c = [].concat.apply([], report.sweep.cells);
+      k['Sweep: buzz spots'] = c.filter(function (x) { return x.status === 'buzz'; }).length;
+      k['Sweep: dead spots'] = c.filter(function (x) { return x.status === 'dead'; }).length;
+    }
+    if (report.stability) report.stability.rows.forEach(function (r) { if (r) k['Drift ' + DSP.STRINGS[r.string].name] = r.driftCents; });
+    if (report.pressure && report.pressure.medianFretted !== null) k['Pressure: fretted median'] = report.pressure.medianFretted;
+    if (report.manual) ['reliefMm', 'actionBassMm', 'actionTrebleMm'].forEach(function (key) { const v = num(report.manual[key]); if (v !== null) k[key] = v; });
+    return k;
+  }
+
+  function compare(before, after) {
+    const a = keyNumbers(before), b = keyNumbers(after);
+    return Array.from(new Set(Object.keys(a).concat(Object.keys(b)))).map(function (key) {
+      return { key: key, before: a[key] === undefined ? null : a[key], after: b[key] === undefined ? null : b[key] };
+    });
+  }
+
+  function fmtCents(c) { return (c >= 0 ? '+' : '') + c.toFixed(1) + ' c'; }
+
+  return Object.freeze({
+    TOL: TOL, MANUAL_SPEC: MANUAL_SPEC,
+    findOnset: findOnset, decayTime: decayTime, attackNoise: attackNoise, steadyPitch: steadyPitch, analyzeNote: analyzeNote,
+    intonation: intonation, intonationFindings: intonationFindings, nut: nut, sweep: sweep, stability: stability,
+    pressure: pressure, balance: balance, manual: manual, summarize: summarize, compare: compare, fmtCents: fmtCents
   });
 })();
 </script>
@@ -464,15 +935,16 @@ const Store = (function () {
   }
 
   // fn(state) -> new state. Returns { ok, state }.
+  // The in-memory copy only changes when the write succeeded, so the UI never shows data that is not saved.
   function update(fn) {
     const next = fn(load());
-    cache = next;
     try {
       localStorage.setItem(KEY, JSON.stringify(next));
+      cache = next;
       return { ok: true, state: next };
     } catch (e) {
       console.error('Could not save progress:', e);
-      return { ok: false, state: next };
+      return { ok: false, state: load() };
     }
   }
 
@@ -846,10 +1318,11 @@ function HomeScreen() {
     mount: function (root) {
       const s = Store.load().settings;
       root.innerHTML =
-        '<p class="muted">Checkpoint 1: tuner and microphone calibration. Practice features arrive in the next checkpoints.</p>' +
+        '<p class="muted">Tuner, calibration and the Guitar Health Check. Practice features arrive in the next checkpoints.</p>' +
         (s.noiseFloorDb === null ? '<p class="status">First time? Open <b>Calibration</b> first, then the <b>Tuner</b>.</p>' : '') +
         '<div class="tiles">' +
         '<a class="btn tile" href="#tuner">Tuner<span class="sub">standard EADGBE</span></a>' +
+        '<a class="btn tile" href="#health">Guitar Health Check<span class="sub">setup, intonation, buzz, nut</span></a>' +
         '<a class="btn tile" href="#calibrate">Calibration<span class="sub">' +
         (s.noiseFloorDb === null ? 'not calibrated yet' : 'noise floor ' + s.noiseFloorDb.toFixed(0) + ' dB') + '</span></a>' +
         '</div>';
@@ -1243,7 +1716,8 @@ function CalibrateScreen() {
 }
 
 // ---------- router ----------
-const SCREENS = { home: HomeScreen, tuner: TunerScreen, calibrate: CalibrateScreen };
+// health: defined in the health-ui script below, resolved when the route is opened
+const SCREENS = { home: HomeScreen, tuner: TunerScreen, calibrate: CalibrateScreen, health: function () { return HealthScreen(); } };
 let currentScreen = null;
 
 function route() {
@@ -1266,7 +1740,632 @@ AudioEngine.onState(function (on) {
 });
 window.addEventListener('hashchange', route);
 window.addEventListener('error', function (e) { console.error('Unexpected error:', e.error || e.message); });
-route();
+document.addEventListener('DOMContentLoaded', route);   // after all screen scripts have loaded
+</script>
+
+<!-- ===================== HEALTH UI: guided Guitar Health Check ===================== -->
+<script id="health-ui">
+'use strict';
+// ===== Guitar Health Check (wizard). Pure analysis lives in health-core (GuitarHealth). =====
+const HC = GuitarHealth;
+const HC_STRING_LABELS = ['6 (low E)', '5 (A)', '4 (D)', '3 (G)', '2 (B)', '1 (high e)'];
+const HC_CAPTURE_SEC = 2.2, HC_PREROLL_SEC = 0.15, HC_TIMEOUT_SEC = 12;
+const HC_STABILITY_MIN = 10;
+const HC_VOICINGS = Object.freeze({   // low E -> high e, null = not played (pinky-free shapes)
+  C: [null, 3, 2, 0, 1, 0], G: [3, 2, 0, 0, 0, 3], A: [null, 0, 2, 2, 2, 0], D: [null, null, 0, 2, 3, 2], E: [0, 2, 2, 1, 0, 0]
+});
+const HC_CHECKS = [
+  { id: 'manual', title: 'Manual checklist', sub: 'strings, relief, action, pickups (do this first)' },
+  { id: 'stability', title: 'Tuning stability', sub: 'snapshot now, re-measure after ' + HC_STABILITY_MIN + ' min of playing' },
+  { id: 'nut', title: 'Nut height', sub: 'open vs 1st fret, per string' },
+  { id: 'intonation', title: 'Intonation', sub: 'open/harmonic vs 12th fret, with fix loop' },
+  { id: 'sweep', title: 'Fret sweep', sub: 'frets 1-12, dead notes, buzz, heatmap' },
+  { id: 'pressure', title: 'Fretting pressure', sub: 'hold a chord, pluck each string' },
+  { id: 'balance', title: 'String balance', sub: 'open strings, even picking (low confidence)' }
+];
+
+function hcOpenMidi(s) { return DSP.STRINGS[s].midi; }
+function hcCents(c) { return c === null || c === undefined ? '-' : HC.fmtCents(c); }
+
+// Compact, storable subset of an analyzeNote result.
+function hcCompact(m) {
+  if (!m) return null;
+  const keep = ['found', 'reason', 'freq', 'midi', 'name', 'cents', 'matches', 'spreadCents', 'peakDb', 'decaySec', 'decayCapped', 'noise', 'userBuzz'];
+  const out = {};
+  keep.forEach(function (k) { if (m[k] !== undefined) out[k] = typeof m[k] === 'number' ? Math.round(m[k] * 1000) / 1000 : m[k]; });
+  return out;
+}
+
+// ---------- draft persistence (immutable updates) ----------
+function hcEmptyDraft() {
+  return {
+    startedAt: Date.now(), manual: {}, intonation: [null, null, null, null, null, null], intonationRef: 'open',
+    nut: [null, null, null, null, null, null],
+    sweep: DSP.STRINGS.map(function () { return new Array(12).fill(null); }),
+    stability: { before: null, beforeAt: null, after: null, afterAt: null },
+    pressure: { chord: 'C', notes: [null, null, null, null, null, null] },
+    balance: [null, null, null, null, null, null]
+  };
+}
+function hcDraft() { return Store.load().healthDraft || hcEmptyDraft(); }
+function hcSaveDraft(fn) {
+  const res = Store.update(function (s) { return Object.assign({}, s, { healthDraft: fn(s.healthDraft || hcEmptyDraft()) }); });
+  if (!res.ok) hcSaveError();
+  return res;
+}
+function hcSaveError() {
+  const main = document.getElementById('app');
+  if (main.querySelector('.hc-save-error')) return;
+  const p = document.createElement('p');
+  p.className = 'status err hc-save-error';
+  p.textContent = 'Could not save this measurement (browser storage full or blocked, e.g. private mode). Export a backup and free space.';
+  main.prepend(p);
+}
+function hcSetIn(arr, i, v) { return arr.map(function (x, j) { return j === i ? v : x; }); }
+
+// Draft -> report object understood by GuitarHealth.summarize / compare.
+function hcBuildReport(d) {
+  const r = {};
+  if (d.intonation.some(Boolean)) r.intonation = d.intonation.map(function (x, s) { return x && x.ref && x.fretted ? HC.intonation(s, x.ref, x.fretted, x.refKind) : null; });
+  if (d.nut.some(Boolean)) r.nut = HC.nut(d.nut);
+  if (d.sweep.some(function (row) { return row.some(Boolean); })) r.sweep = HC.sweep(d.sweep);
+  if (d.stability.before && d.stability.after) {
+    r.stability = HC.stability(d.stability.before, d.stability.after, (d.stability.afterAt - d.stability.beforeAt) / 60000);
+  }
+  const pv = HC_VOICINGS[d.pressure.chord];
+  if (d.pressure.notes.some(Boolean)) {
+    r.pressure = HC.pressure(d.pressure.notes.map(function (m, s) { return m ? { fretted: pv[s] > 0, m: m } : null; }), hcOpenRefs(d));
+  }
+  if (d.balance.filter(function (x) { return x !== null; }).length) r.balance = HC.balance(d.balance);
+  if (Object.keys(d.manual).length) r.manual = d.manual;
+  return r;
+}
+
+// Latest open-string measurements (to remove tuning offsets in the pressure check).
+function hcOpenRefs(d) {
+  return DSP.STRINGS.map(function (_, s) {
+    if (d.stability.after && d.stability.after[s]) return d.stability.after[s];
+    if (d.stability.before && d.stability.before[s]) return d.stability.before[s];
+    if (d.nut[s] && d.nut[s].open) return d.nut[s].open;
+    if (d.intonation[s] && d.intonation[s].refKind === 'open') return d.intonation[s].ref;
+    return null;
+  });
+}
+
+// ---------- capture one plucked note from the dry input ----------
+// Resolves with an analyzeNote result (found:false on timeout/cancel). cancel() via returned handle.
+function hcCapture(expectedMidi, onState) {
+  let off = null, timer = null, settled = false, resolveFn;
+  const sr = AudioEngine.sampleRate();
+  const pre = [], post = [];
+  let preLen = 0, postLen = 0, triggered = false, onsetIdx = 0;
+  const recentDb = [];                        // chunk levels of the last ~150 ms
+  const preMax = Math.round(HC_PREROLL_SEC * sr), need = Math.round(HC_CAPTURE_SEC * sr);
+  const finish = function (result) {
+    if (settled) return;
+    settled = true;
+    if (off) off();
+    clearTimeout(timer);
+    resolveFn(result);
+  };
+  const promise = new Promise(function (resolve) {
+    resolveFn = resolve;
+    onState('listening');
+    off = AudioEngine.onChunk(function (chunk) {
+      if (!triggered) {
+        pre.push(chunk); preLen += chunk.length;
+        while (preLen - pre[0].length >= preMax) preLen -= pre.shift().length;
+        // a NEW attack: above the gate and >= 6 dB above the recent minimum (a still-ringing note never rises)
+        const db = DSP.toDb(DSP.rms(chunk));
+        const history = recentDb.length >= 3;      // no trigger until the recent level is known (else a ringing tail triggers)
+        const floor = history ? Math.min.apply(null, recentDb) : db;
+        recentDb.push(db);
+        if (recentDb.length > Math.ceil(0.15 * sr / chunk.length)) recentDb.shift();
+        if (history && db > AudioEngine.gateDb() && db - floor >= DSP.CONFIG.onsetRiseDb) {
+          triggered = true;
+          onsetIdx = preLen - chunk.length;
+          onState('recording');
+        }
+        return;
+      }
+      post.push(chunk); postLen += chunk.length;
+      if (postLen >= need) {
+        const all = new Float32Array(preLen + postLen);
+        let o = 0;
+        pre.concat(post).forEach(function (c) { all.set(c, o); o += c.length; });
+        onState('analysing');
+        setTimeout(function () {
+          try { finish(HC.analyzeNote(all, sr, AudioEngine.gateDb(), expectedMidi, onsetIdx / sr)); }
+          catch (e) { console.error('Note analysis failed:', e); finish({ found: false, reason: 'analysis error' }); }
+        }, 0);
+      }
+    });
+    timer = setTimeout(function () { finish({ found: false, reason: 'nothing heard in ' + HC_TIMEOUT_SEC + ' s' }); }, HC_TIMEOUT_SEC * 1000);
+  });
+  return { promise: promise, cancel: function () { finish({ found: false, reason: 'cancelled' }); } };
+}
+
+function hcDescribe(m, expectedMidi) {
+  if (!m.found) return '<span class="pill bad">' + esc(m.reason || 'not heard') + '</span>';
+  const wrong = expectedMidi !== undefined && !m.matches;
+  return (wrong ? '<span class="pill bad">heard ' + esc(m.name) + ', expected ' + esc(DSP.noteName(expectedMidi)) + '</span> '
+    : '<span class="pill ok">' + esc(m.name) + '</span> ') +
+    '<span class="mono">' + hcCents(m.cents) + '</span>' +
+    (m.spreadCents > 3 ? ' <span class="pill warn">unsteady</span>' : '');
+}
+
+// ---------- screen ----------
+function HealthScreen() {
+  let root = null, view = { name: 'menu' }, capture = null, tick = null, gen = 0;
+
+  function go(v) { stopCapture(); clearInterval(tick); view = v; render(); }
+
+  // Every render bumps `gen`; an async measurement started under an older render must stop (stale view/position).
+  function stale(my) { return my !== gen || !root || !root.isConnected; }
+
+  // While a measurement loop runs, its action buttons are disabled (navigation stays enabled to cancel).
+  function busy(on) {
+    Array.prototype.forEach.call(root.querySelectorAll('button:not([data-go]), select'), function (b) { b.disabled = on; });
+  }
+  function stopCapture() { if (capture) { capture.cancel(); capture = null; } }
+
+  // Runs one capture, updates #hcStatus, resolves with the measurement (compact).
+  function listen(expectedMidi, prompt) {
+    stopCapture();
+    const status = $(root, '#hcStatus');
+    const setState = function (st) {
+      if (!status) return;
+      status.innerHTML = st === 'listening' ? '<span class="pill warn">listening...</span> ' + esc(prompt)
+        : st === 'recording' ? '<span class="pill ok">recording - let it ring</span>' : '<span class="pill">analysing...</span>';
+    };
+    capture = hcCapture(expectedMidi, setState);
+    return capture.promise.then(function (m) {
+      capture = null;
+      if (status) status.innerHTML = hcDescribe(m, expectedMidi);
+      return hcCompact(m);
+    });
+  }
+
+  function header(title, intro) {
+    return '<p><button class="back" data-go="menu">&larr; All checks</button></p><h2>' + esc(title) + '</h2>' +
+      (intro ? '<p class="small muted">' + intro + '</p>' : '');
+  }
+
+  function wire() {
+    Array.prototype.forEach.call(root.querySelectorAll('[data-go]'), function (b) {
+      b.addEventListener('click', function () { go({ name: b.getAttribute('data-go') }); });
+    });
+  }
+
+  function render() {
+    gen++;
+    clearInterval(tick);
+    const fn = { menu: renderMenu, manual: renderManual, stability: renderStability, nut: renderNut, intonation: renderIntonation,
+      sweep: renderSweep, pressure: renderPressure, balance: renderBalance, summary: renderSummary, history: renderHistory }[view.name];
+    fn();
+    wire();
+  }
+
+  // ----- menu -----
+  function checkDone(d, id) {
+    if (id === 'manual') return Object.keys(d.manual).length > 0;
+    if (id === 'stability') return !!d.stability.after;
+    if (id === 'nut') return d.nut.filter(Boolean).length;
+    if (id === 'intonation') return d.intonation.filter(Boolean).length;
+    if (id === 'sweep') return d.sweep.reduce(function (a, r) { return a + r.filter(Boolean).length; }, 0);
+    if (id === 'pressure') return d.pressure.notes.filter(Boolean).length;
+    if (id === 'balance') return d.balance.filter(function (x) { return x !== null; }).length;
+    return 0;
+  }
+
+  function renderMenu() {
+    const d = hcDraft();
+    const reports = Store.load().healthReports || [];
+    root.innerHTML =
+      '<p class="small muted">Use the iRig. Tune the guitar first. Results are kept until you save the report, so you can do the checks ' +
+      'in several sittings. Suggested order: top to bottom (set relief and action before intonation).</p>' +
+      '<div class="panel small">Draft started ' + esc(new Date(d.startedAt).toLocaleString()) +
+      ' <button class="back" id="hcReset">Start a new draft</button></div>' +
+      '<div class="tiles">' + HC_CHECKS.map(function (c) {
+        const n = checkDone(d, c.id);
+        return '<button class="tile" data-go="' + c.id + '">' + esc(c.title) + '<span class="sub">' + esc(c.sub) + '</span>' +
+          '<span class="pill' + (n ? ' ok' : '') + '">' + (n ? (n === true ? 'done' : n + ' measured') : 'not done') + '</span></button>';
+      }).join('') + '</div>' +
+      '<p style="margin-top:16px"><button class="primary block" data-go="summary">Summary report</button></p>' +
+      '<p><button class="block" data-go="history">History (' + reports.length + ' saved)</button></p>';
+    $(root, '#hcReset').addEventListener('click', function () {
+      if (!confirmInline(this, 'Tap again to discard the current draft')) return;
+      hcSaveDraft(function () { return hcEmptyDraft(); });
+      render();
+    });
+  }
+
+  // Two-tap confirmation without browser dialogs.
+  function confirmInline(btn, text) {
+    if (btn.getAttribute('data-armed')) return true;
+    btn.setAttribute('data-armed', '1');
+    btn.textContent = text;
+    return false;
+  }
+
+  // ----- manual checklist -----
+  function renderManual() {
+    const m = hcDraft().manual, S = HC.MANUAL_SPEC;
+    const field = function (key, label, how, unit) {
+      return '<div class="panel"><b>' + label + '</b><p class="small muted">' + how + '</p>' +
+        '<div class="row"><input class="num" type="number" inputmode="decimal" step="0.05" min="0" id="m_' + key + '" value="' +
+        esc(m[key] === undefined ? '' : m[key]) + '"><span>' + unit + '</span></div></div>';
+    };
+    root.innerHTML = header('Manual checklist', 'No audio. Measure with a steel ruler and a feeler gauge (or a business card, about 0.25 mm). ' +
+      'Typical values are factory starting points for a Les Paul-style guitar, not strict rules.') +
+      field('stringAgeWeeks', 'String age', 'Weeks since the strings were changed. Old strings make intonation impossible to set: change them first if they are old.', 'weeks') +
+      field('reliefMm', 'Neck relief', 'Capo at the 1st fret. Hold the low E down where the neck meets the body (around fret 16). ' +
+        'Measure the gap between the bottom of the string and the top of the 7th fret. Typical ' + S.reliefMm.typical + '.', 'mm') +
+      field('actionBassMm', 'Action at 12th fret, low E', 'In tune, no capo: from the top of the 12th fret to the bottom of the low E string. Typical ' + S.actionBassMm.typical + '.', 'mm') +
+      field('actionTrebleMm', 'Action at 12th fret, high e', 'Same for the high e string. Typical ' + S.actionTrebleMm.typical + '.', 'mm') +
+      field('pickupNeckMm', 'Neck pickup height (bass side)', 'Hold the low E at the last fret; measure from the bottom of the string to the top of the pole piece. Typical ' + S.pickupNeckMm.typical + '.', 'mm') +
+      field('pickupBridgeMm', 'Bridge pickup height (bass side)', 'Same method, bridge pickup. Typical ' + S.pickupBridgeMm.typical + '.', 'mm') +
+      '<button class="primary block" id="hcManualSave">Save checklist</button><p class="small" id="hcStatus">&nbsp;</p>';
+    $(root, '#hcManualSave').addEventListener('click', function () {
+      const keys = ['stringAgeWeeks', 'reliefMm', 'actionBassMm', 'actionTrebleMm', 'pickupNeckMm', 'pickupBridgeMm'];
+      const vals = {};
+      keys.forEach(function (k) {
+        const v = $(root, '#m_' + k).value.trim();
+        if (v !== '' && !isNaN(Number(v)) && Number(v) >= 0) vals[k] = v;
+      });
+      const res = hcSaveDraft(function (d) { return Object.assign({}, d, { manual: vals }); });
+      $(root, '#hcStatus').innerHTML = res.ok ? '<span class="pill ok">saved</span> ' + HC.manual(vals).map(function (f) {
+        return esc(f.title); }).join('; ') : '<span class="pill bad">could not save</span>';
+    });
+  }
+
+  // ----- generic per-string table + runner -----
+  function stringTable(rows) {
+    return '<table class="small"><tbody>' + rows.map(function (r) {
+      return '<tr><td>' + esc(r[0]) + '</td>' + r.slice(1).map(function (c) { return '<td class="mono">' + c + '</td>'; }).join('') + '</tr>';
+    }).join('') + '</tbody></table>';
+  }
+
+  function promptCard(id) { return '<div class="panel hc-prompt" id="' + id + '"></div><p class="small" id="hcStatus">&nbsp;</p>'; }
+
+  function setPrompt(html) { const p = $(root, '.hc-prompt'); if (p) p.innerHTML = html; }
+
+  // ----- stability -----
+  function renderStability() {
+    const d = hcDraft(), st = d.stability;
+    const elapsed = st.beforeAt ? (Date.now() - st.beforeAt) / 60000 : 0;
+    const res = st.before && st.after ? HC.stability(st.before, st.after, (st.afterAt - st.beforeAt) / 60000) : null;
+    root.innerHTML = header('Tuning stability', 'Tune all six strings, take the snapshot, then play normally (bends included) for ' +
+      HC_STABILITY_MIN + ' minutes and re-measure. You can leave this screen meanwhile.') +
+      promptCard('hcPrompt') +
+      '<div class="row"><button class="primary grow" id="hcSnap">' + (st.before ? 'Take snapshot again' : 'Take snapshot (6 open strings)') + '</button>' +
+      '<button class="grow" id="hcAfter"' + (st.before ? '' : ' disabled') + '>Re-measure</button></div>' +
+      '<p class="small" id="hcTimer"></p>' +
+      stringTable(DSP.STRINGS.map(function (s, i) {
+        const b = st.before && st.before[i], a = st.after && st.after[i];
+        const r = res && res.rows[i];
+        return [HC_STRING_LABELS[i], 'before ' + (b && b.found ? hcCents(b.cents) : '-'), 'after ' + (a && a.found ? hcCents(a.cents) : '-'),
+          r ? '<b>' + hcCents(r.driftCents) + '</b>' : ''];
+      })) + findingsHtml(res ? res.findings : []);
+    const timer = $(root, '#hcTimer');
+    const upd = function () {
+      if (!st.beforeAt || st.after) { timer.textContent = ''; return; }
+      const min = (Date.now() - st.beforeAt) / 60000;
+      timer.textContent = min < HC_STABILITY_MIN ? 'Snapshot ' + min.toFixed(1) + ' min ago - play for ' + (HC_STABILITY_MIN - min).toFixed(1) + ' more min'
+        : 'Ready to re-measure (' + min.toFixed(0) + ' min since snapshot)';
+    };
+    upd();
+    tick = setInterval(upd, 5000);
+    setPrompt(elapsed && !st.after ? 'Snapshot taken. Re-measure after playing.' : 'Ready.');
+    $(root, '#hcSnap').addEventListener('click', function () { runOpenSet('before'); });
+    $(root, '#hcAfter').addEventListener('click', function () { runOpenSet('after'); });
+  }
+
+  async function runOpenSet(which) {
+    const my = gen, results = [];
+    busy(true);
+    for (let s = 0; s < 6; s++) {
+      setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>Pluck it open once and let it ring.</p>');
+      const m = await listen(hcOpenMidi(s), 'pluck string ' + HC_STRING_LABELS[s] + ' open');
+      if (stale(my)) return;
+      results.push(m);
+    }
+    const now = Date.now();
+    hcSaveDraft(function (d) {
+      const st = which === 'before' ? { before: results, beforeAt: now, after: null, afterAt: null }
+        : Object.assign({}, d.stability, { after: results, afterAt: now });
+      return Object.assign({}, d, { stability: st });
+    });
+    render();
+  }
+
+  // ----- nut -----
+  function renderNut() {
+    const d = hcDraft();
+    const res = HC.nut(d.nut);
+    root.innerHTML = header('Nut height', 'Tune first. For each string: pluck it open, then fret the 1st fret with normal (light) pressure and pluck. ' +
+      'If the nut slots are too high, 1st-fret notes come out sharp.') + promptCard('hcPrompt') +
+      '<button class="primary block" id="hcRun">Measure all strings</button>' +
+      stringTable(DSP.STRINGS.map(function (s, i) {
+        const r = res.rows[i];
+        return [HC_STRING_LABELS[i], r ? '1st fret ' + hcCents(r.sharpCents) : '-'];
+      })) + findingsHtml(res.findings);
+    setPrompt('Ready.');
+    $(root, '#hcRun').addEventListener('click', async function () {
+      const my = gen;
+      busy(true);
+      for (let s = 0; s < 6; s++) {
+        setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>1) open</p>');
+        const open = await listen(hcOpenMidi(s), 'pluck open');
+        if (stale(my)) return;
+        setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>2) 1st fret, light pressure</p>');
+        const fret1 = await listen(hcOpenMidi(s) + 1, 'pluck at the 1st fret');
+        if (stale(my)) return;
+        const ok = open && open.found && fret1 && fret1.found && fret1.matches;
+        hcSaveDraft(function (dd) { return Object.assign({}, dd, { nut: hcSetIn(dd.nut, s, ok ? { open: open, fret1: fret1 } : null) }); });
+      }
+      render();
+    });
+  }
+
+  // ----- intonation -----
+  function renderIntonation() {
+    const d = hcDraft();
+    const s = view.string === undefined ? 0 : view.string;
+    const refKind = d.intonationRef;
+    const rows = d.intonation.map(function (x, i) { return x && x.ref && x.fretted ? HC.intonation(i, x.ref, x.fretted, x.refKind) : null; });
+    const cur = rows[s];
+    root.innerHTML = header('Intonation', 'Fresh strings, relief and action set, guitar in tune. Compare the open string (or its 12th-fret harmonic) ' +
+      'with the fretted 12th fret. OK within +-5 cents.') +
+      '<div class="row"><select id="hcString" class="grow">' + HC_STRING_LABELS.map(function (l, i) {
+        return '<option value="' + i + '"' + (i === s ? ' selected' : '') + '>String ' + l + '</option>'; }).join('') + '</select>' +
+      '<select id="hcRef" class="grow"><option value="open"' + (refKind === 'open' ? ' selected' : '') + '>Reference: open string</option>' +
+      '<option value="harmonic"' + (refKind === 'harmonic' ? ' selected' : '') + '>Reference: 12th-fret harmonic</option></select></div>' +
+      promptCard('hcPrompt') +
+      '<button class="primary block" id="hcRun">' + (cur ? 'Re-measure after adjusting' : 'Measure this string') + '</button>' +
+      (cur ? '<div class="panel"><div class="big-label">' + hcCents(cur.offsetCents) + '</div><p><span class="pill ' +
+        (cur.status === 'ok' ? 'ok' : 'bad') + '">' + cur.status + '</span> ' + esc(cur.advice) + '</p>' +
+        (cur.status === 'ok' ? '' : '<p class="small muted">Loop: loosen the string slightly, move the saddle a little (quarter to half turn), ' +
+          'retune the open string with the Tuner, then re-measure. Watch which way the saddle moves rather than the screw.</p>') +
+        '<p class="small muted">open string tuning when measured: ' + hcCents(d.intonation[s].ref.cents) + '</p>' +
+        (s < 5 ? '<button class="block" id="hcNext">Next string</button>' : '') + '</div>' : '') +
+      stringTable(rows.map(function (r, i) {
+        return [HC_STRING_LABELS[i], r ? hcCents(r.offsetCents) : '-', r ? '<span class="pill ' + (r.status === 'ok' ? 'ok' : 'bad') + '">' + r.status + '</span>' : '',
+          r ? r.confidence : ''];
+      })) + findingsHtml(HC.intonationFindings(rows));
+    setPrompt('String ' + esc(HC_STRING_LABELS[s]) + ': ready.');
+    $(root, '#hcString').addEventListener('change', function () { go({ name: 'intonation', string: Number(this.value) }); });
+    $(root, '#hcRef').addEventListener('change', function () {
+      const v = this.value;
+      hcSaveDraft(function (dd) { return Object.assign({}, dd, { intonationRef: v }); });
+    });
+    const next = $(root, '#hcNext');
+    if (next) next.addEventListener('click', function () { go({ name: 'intonation', string: s + 1 }); });
+    $(root, '#hcRun').addEventListener('click', async function () {
+      const my = gen, kind = hcDraft().intonationRef;
+      busy(true);
+      const open = hcOpenMidi(s);
+      setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>1) ' +
+        (kind === 'harmonic' ? 'touch the string lightly right above the 12th fret wire and pluck (harmonic)' : 'pluck the open string') + '</p>');
+      const ref = await listen(kind === 'harmonic' ? open + 12 : open, kind === 'harmonic' ? 'play the 12th-fret harmonic' : 'pluck open');
+      if (stale(my)) return;
+      if (!ref || !ref.found || !ref.matches) { busy(false); return; }
+      setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>2) fret the 12th fret normally and pluck</p>');
+      const fretted = await listen(open + 12, 'pluck at the 12th fret');
+      if (stale(my)) return;
+      if (!fretted || !fretted.found || !fretted.matches) { busy(false); return; }
+      hcSaveDraft(function (dd) { return Object.assign({}, dd, { intonation: hcSetIn(dd.intonation, s, { ref: ref, fretted: fretted, refKind: kind }) }); });
+      go({ name: 'intonation', string: s });
+    });
+  }
+
+  // ----- fret sweep -----
+  function heatmap(cells, active) {
+    const cw = 26, ch = 22, x0 = 34, y0 = 18;
+    const colors = { ok: 'var(--ok)', buzz: 'var(--accent)', dead: '#9b7bd6', undetected: 'var(--bad)', skipped: '#4a5260' };
+    const letters = { ok: '', buzz: 'B', dead: 'D', undetected: '?', skipped: '-' };
+    let svg = '<svg viewBox="0 0 ' + (x0 + 12 * cw + 4) + ' ' + (y0 + 6 * ch + 4) + '" class="heatmap" role="img" aria-label="Fret sweep heatmap">';
+    for (let f = 1; f <= 12; f++) svg += '<text x="' + (x0 + (f - 0.5) * cw) + '" y="12" class="hm-t">' + f + '</text>';
+    for (let row = 0; row < 6; row++) {
+      const s = 5 - row;                       // high e at the top, like tab
+      svg += '<text x="4" y="' + (y0 + row * ch + 15) + '" class="hm-t" text-anchor="start">' + esc(DSP.STRINGS[s].name.replace(/\d/, '')) + '</text>';
+      for (let f = 1; f <= 12; f++) {
+        const c = cells && cells[s] && cells[s][f - 1];
+        const st = c ? c.status : null;
+        const isActive = active && active.s === s && active.f === f;
+        svg += '<rect x="' + (x0 + (f - 1) * cw + 1) + '" y="' + (y0 + row * ch + 1) + '" width="' + (cw - 2) + '" height="' + (ch - 2) +
+          '" rx="4" fill="' + (st ? colors[st] : '#2a313b') + '"' + (isActive ? ' stroke="#fff" stroke-width="2"' : '') + '/>';
+        if (st && letters[st]) svg += '<text x="' + (x0 + (f - 0.5) * cw) + '" y="' + (y0 + row * ch + 15) + '" class="hm-l">' + letters[st] + '</text>';
+      }
+    }
+    return svg + '</svg><p class="small muted">green ok &middot; B buzz (you marked) &middot; D short sustain &middot; ? not detected &middot; - skipped</p>';
+  }
+
+  function sweepCells(d) {
+    // per-row statuses even if partially measured
+    const res = HC.sweep(d.sweep.map(function (row) { return row.map(function (m) { return m; }); }));
+    return { cells: d.sweep.map(function (row, s) { return row.map(function (m, f) { return m ? res.cells[s][f] : null; }); }), findings: res.findings };
+  }
+
+  function renderSweep() {
+    const d = hcDraft();
+    const pos = view.pos || { s: 0, f: 1 };
+    const sc = sweepCells(d);
+    root.innerHTML = header('Fret sweep', 'Each string, frets 1 to 12, one firm pluck each. After each note tap whether it was clean or buzzed ' +
+      '(listen closely; buzz is often easier to hear acoustically). Dead notes and undetected notes are found automatically.') +
+      heatmap(sc.cells, pos) + promptCard('hcPrompt') +
+      '<div class="row"><button class="primary grow" id="hcGo">Listen</button><button class="grow" id="hcSkip">Skip</button></div>' +
+      '<div class="row" style="margin-top:8px"><button class="ok grow" id="hcClean" disabled>Clean - next</button>' +
+      '<button class="grow" id="hcBuzz" disabled style="background:var(--accent);color:#1a1205">It buzzed - next</button></div>' +
+      '<div class="row" style="margin-top:8px"><select id="hcFrom" class="grow">' + HC_STRING_LABELS.map(function (l, i) {
+        return '<option value="' + i + '"' + (i === pos.s ? ' selected' : '') + '>Start at string ' + l + '</option>'; }).join('') + '</select></div>' +
+      findingsHtml(sc.findings);
+    setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[pos.s]) + ', fret ' + pos.f + '</div>');
+    let last = null;
+    const advance = function () {
+      const nf = pos.f < 12 ? { s: pos.s, f: pos.f + 1 } : pos.s < 5 ? { s: pos.s + 1, f: 1 } : null;
+      go({ name: 'sweep', pos: nf || { s: 0, f: 1 }, auto: !!nf });
+    };
+    const store = function (m) {
+      hcSaveDraft(function (dd) {
+        return Object.assign({}, dd, { sweep: dd.sweep.map(function (row, s) { return s === pos.s ? hcSetIn(row, pos.f - 1, m) : row; }) });
+      });
+    };
+    const listenNow = async function () {
+      const my = gen;
+      $(root, '#hcGo').disabled = true;
+      const m = await listen(hcOpenMidi(pos.s) + pos.f, 'pluck string ' + HC_STRING_LABELS[pos.s] + ' at fret ' + pos.f);
+      if (stale(my)) return;                    // skipped / moved on while listening: drop this result
+      last = m;
+      $(root, '#hcGo').disabled = false;
+      $(root, '#hcGo').textContent = 'Redo';
+      $(root, '#hcClean').disabled = false;
+      $(root, '#hcBuzz').disabled = false;
+    };
+    $(root, '#hcGo').addEventListener('click', listenNow);
+    $(root, '#hcSkip').addEventListener('click', function () { store(null); advance(); });
+    $(root, '#hcClean').addEventListener('click', function () { store(Object.assign({}, last, { userBuzz: false })); advance(); });
+    $(root, '#hcBuzz').addEventListener('click', function () { store(Object.assign({}, last, { userBuzz: true })); advance(); });
+    $(root, '#hcFrom').addEventListener('change', function () { go({ name: 'sweep', pos: { s: Number(this.value), f: 1 } }); });
+    if (view.auto) listenNow();                 // keep the flow going after each answer
+  }
+
+  // ----- pressure -----
+  function renderPressure() {
+    const d = hcDraft(), chord = d.pressure.chord, v = HC_VOICINGS[chord];
+    const res = d.pressure.notes.some(Boolean)
+      ? HC.pressure(d.pressure.notes.map(function (m, s) { return m ? { fretted: v[s] > 0, m: m } : null; }), hcOpenRefs(d)) : null;
+    root.innerHTML = header('Fretting pressure', 'Hold the chord shape with your normal grip. Keep holding and pluck each string one at a time. ' +
+      'Open-string tuning measured in other checks is subtracted when available; otherwise tune first.') +
+      '<div class="row"><select id="hcChord" class="grow">' + Object.keys(HC_VOICINGS).map(function (c) {
+        return '<option' + (c === chord ? ' selected' : '') + '>' + c + '</option>'; }).join('') + '</select>' +
+      '<span class="mono">' + v.map(function (f) { return f === null ? 'x' : f; }).join('') + '</span></div>' +
+      promptCard('hcPrompt') + '<button class="primary block" id="hcRun">Measure (hold the chord)</button>' +
+      stringTable(DSP.STRINGS.map(function (s, i) {
+        if (v[i] === null) return [HC_STRING_LABELS[i], 'not played'];
+        const r = res && res.rows.find(function (x) { return x.string === i; });
+        return [HC_STRING_LABELS[i], (v[i] ? 'fret ' + v[i] : 'open'), r ? hcCents(r.cents) : '-'];
+      })) + findingsHtml(res ? res.findings : []);
+    setPrompt('Ready.');
+    $(root, '#hcChord').addEventListener('change', function () {
+      const c = this.value;
+      hcSaveDraft(function (dd) { return Object.assign({}, dd, { pressure: { chord: c, notes: [null, null, null, null, null, null] } }); });
+      render();
+    });
+    $(root, '#hcRun').addEventListener('click', async function () {
+      const my = gen, notes = [null, null, null, null, null, null];
+      busy(true);
+      for (let s = 0; s < 6; s++) {
+        if (v[s] === null) continue;
+        setPrompt('<div class="big-label">' + esc(chord) + ': string ' + esc(HC_STRING_LABELS[s]) + '</div><p>keep holding, pluck this string only</p>');
+        const m = await listen(hcOpenMidi(s) + v[s], 'pluck string ' + HC_STRING_LABELS[s]);
+        if (stale(my)) return;
+        notes[s] = m && m.found && m.matches ? m : null;
+      }
+      hcSaveDraft(function (dd) { return Object.assign({}, dd, { pressure: { chord: chord, notes: notes } }); });
+      render();
+    });
+  }
+
+  // ----- balance -----
+  function renderBalance() {
+    const d = hcDraft();
+    const res = d.balance.filter(function (x) { return x !== null; }).length ? HC.balance(d.balance) : null;
+    root.innerHTML = header('String balance', 'Pluck each open string with the same strength (rest stroke, same spot). ' +
+      'Picking varies a lot, so treat the result as low confidence; repeat a few times before adjusting anything.') +
+      promptCard('hcPrompt') + '<button class="primary block" id="hcRun">Measure all strings</button>' +
+      stringTable(DSP.STRINGS.map(function (s, i) {
+        const r = res && res.rows.find(function (x) { return x.string === i; });
+        return [HC_STRING_LABELS[i], r ? (r.relDb > 0 ? '+' : '') + r.relDb.toFixed(1) + ' dB' : '-'];
+      })) + findingsHtml(res ? res.findings : []);
+    setPrompt('Ready.');
+    $(root, '#hcRun').addEventListener('click', async function () {
+      const my = gen, levels = [];
+      busy(true);
+      for (let s = 0; s < 6; s++) {
+        setPrompt('<div class="big-label">String ' + esc(HC_STRING_LABELS[s]) + '</div><p>pluck open, same strength as the others</p>');
+        const m = await listen(hcOpenMidi(s), 'pluck open');
+        if (stale(my)) return;
+        levels.push(m && m.found ? m.peakDb : null);
+      }
+      hcSaveDraft(function (dd) { return Object.assign({}, dd, { balance: levels }); });
+      render();
+    });
+  }
+
+  // ----- summary, history, compare -----
+  function findingsHtml(list) {
+    if (!list || !list.length) return '';
+    return '<div class="findings">' + list.map(function (f) {
+      return '<div class="panel finding ' + f.severity + '"><b>' + esc(f.title) + '</b><div class="row" style="margin-top:6px">' +
+        '<span class="pill ' + (f.who === 'LUTHIER' ? 'bad' : 'ok') + '">' + f.who + '</span>' +
+        '<span class="pill">' + f.confidence + ' confidence</span></div>' +
+        (f.detail ? '<p class="small">' + esc(f.detail) + '</p>' : '') + (f.fix ? '<p class="small muted">Fix: ' + esc(f.fix) + '</p>' : '') + '</div>';
+    }).join('') + '</div>';
+  }
+
+  function renderSummary() {
+    const report = hcBuildReport(hcDraft());
+    const findings = HC.summarize(report);
+    root.innerHTML = header('Summary report', 'Major issues first. DIY = you can do it with basic tools; LUTHIER = take it to a tech. ' +
+      'Confidence says how much to trust the measurement, not how serious the issue is.') +
+      (findings.length ? findingsHtml(findings) : '<p class="status">No checks done yet.</p>') +
+      (report.sweep ? heatmap(report.sweep.cells) : '') +
+      '<button class="primary block" id="hcSave"' + (findings.length ? '' : ' disabled') + '>Save report to history</button><p class="small" id="hcStatus">&nbsp;</p>';
+    $(root, '#hcSave').addEventListener('click', function () {
+      const entry = { id: Date.now(), date: new Date().toISOString(), report: report, findings: findings };
+      const res = Store.update(function (s) {
+        return Object.assign({}, s, { healthReports: (s.healthReports || []).concat([entry]).slice(-30) });
+      });
+      $(root, '#hcStatus').innerHTML = res.ok ? '<span class="pill ok">saved</span> Start a new draft from the menu for your "after" measurement.'
+        : '<span class="pill bad">could not save (storage full?)</span>';
+    });
+  }
+
+  function renderHistory() {
+    const reports = (Store.load().healthReports || []).slice().reverse();
+    const sel = view.id ? reports.find(function (r) { return r.id === view.id; }) : null;
+    const idx = sel ? reports.indexOf(sel) : -1;
+    const prev = idx >= 0 ? reports[idx + 1] : null;
+    root.innerHTML = header('History', 'Saved reports, newest first. Open one to see it and compare with the one before it.') +
+      (reports.length ? '<div class="tiles">' + reports.map(function (r) {
+        const issues = r.findings.filter(function (f) { return f.severity !== 'ok'; }).length;
+        return '<button class="tile" data-report="' + r.id + '">' + esc(new Date(r.date).toLocaleDateString()) +
+          '<span class="sub">' + esc(new Date(r.date).toLocaleTimeString()) + '</span><span class="pill' + (issues ? ' warn' : ' ok') + '">' +
+          issues + ' issue(s)</span></button>';
+      }).join('') + '</div>' : '<p class="status">Nothing saved yet.</p>') +
+      (sel ? '<h2>Report ' + esc(new Date(sel.date).toLocaleString()) + '</h2>' + findingsHtml(sel.findings) +
+        (prev ? '<h2>Before / after</h2>' + compareTable(prev, sel) : '<p class="small muted">No earlier report to compare with.</p>') : '');
+    Array.prototype.forEach.call(root.querySelectorAll('[data-report]'), function (b) {
+      b.addEventListener('click', function () { go({ name: 'history', id: Number(b.getAttribute('data-report')) }); });
+    });
+  }
+
+  function compareTable(a, b) {
+    const rows = HC.compare(a.report, b.report);
+    if (!rows.length) return '<p class="small muted">No common measurements.</p>';
+    const f = function (v) { return v === null ? '-' : (Math.round(v * 10) / 10).toString(); };
+    return '<table class="small"><thead><tr><th>measure</th><th>' + esc(new Date(a.date).toLocaleDateString()) + '</th><th>' +
+      esc(new Date(b.date).toLocaleDateString()) + '</th><th>change</th></tr></thead><tbody>' + rows.map(function (r) {
+        const diff = r.before !== null && r.after !== null ? r.after - r.before : null;
+        return '<tr><td>' + esc(r.key) + '</td><td class="mono">' + f(r.before) + '</td><td class="mono">' + f(r.after) + '</td><td class="mono">' +
+          (diff === null ? '' : (diff > 0 ? '+' : '') + f(diff)) + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+
+  return {
+    title: 'Guitar Health Check',
+    mount: function (r) {
+      root = r;
+      micGate(r, function () {
+        AudioEngine.setAnalysis({ pitch: false, chords: false });
+        WakeLock.acquire();
+        render();
+      });
+    },
+    leave: function () { view = { name: 'gone' }; stopCapture(); clearInterval(tick); WakeLock.release(); }
+  };
+}
 </script>
 </body>
 </html>

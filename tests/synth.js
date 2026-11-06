@@ -13,7 +13,9 @@ const VOICINGS = Object.freeze({
 const CONDITIONS = Object.freeze({
   clean: { snrDb: 30, tuneCents: 5, hum: 0, micHp: 0, dropString: 0 },
   room: { snrDb: 20, tuneCents: 10, hum: 0.02, micHp: 120, dropString: 0 },
-  harsh: { snrDb: 10, tuneCents: 15, hum: 0.05, micHp: 180, dropString: 0.3 }
+  harsh: { snrDb: 10, tuneCents: 15, hum: 0.05, micHp: 180, dropString: 0.3 },
+  // iRig-style direct input: raw humbucker, no speaker/mic filtering, pickup resonance, picked near the bridge
+  di: { snrDb: 40, tuneCents: 5, hum: 0.005, micHp: 0, dropString: 0, direct: true }
 });
 
 function mulberry32(seed) {
@@ -36,18 +38,24 @@ function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
 
 // Adds one plucked string into `out` (mutates the local render buffer only).
 // stopAt: time (s) where the string is damped (fingers lifted), or undefined.
-function addPluck(out, sr, f0, tStart, amp, rng, cond, stopAt) {
-  const nH = 16;
-  const beta = 0.12 + 0.12 * rng();          // pluck position
+function addPluck(out, sr, f0, tStart, amp, rng, cond, stopAt, tauScale) {
+  const nH = cond.direct ? Math.min(120, Math.floor(8000 / f0)) : 16; // a raw pickup carries partials up to ~8 kHz
+  const beta = cond.direct ? 0.07 + 0.08 * rng() : 0.12 + 0.12 * rng(); // pluck position (pick near bridge = brighter)
   const pickup = 0.27;                       // neck pickup position (fraction of scale)
   const B = 0.00008 + 0.00008 * rng();       // inharmonicity
-  const tau0 = 1.5 + rng();                  // fundamental decay (s)
+  const tau0 = (1.5 + rng()) * (tauScale || 1); // fundamental decay (s); tauScale < 1 = dead note
   const partials = [];
   for (let n = 1; n <= nH; n++) {
     const fn = n * f0 * Math.sqrt(1 + B * n * n);
     if (fn > sr * 0.45) break;
     let a = amp * Math.abs(Math.sin(n * Math.PI * beta)) * (0.3 + Math.abs(Math.sin(n * Math.PI * pickup))) / n;
-    a /= 1 + Math.pow(fn / 4500, 4);         // speaker roll-off
+    if (cond.direct) {
+      // humbucker + cable: resonant peak around 2.5 kHz, then roll-off (no speaker)
+      const x = fn / 2500;
+      a *= 1 / Math.sqrt(Math.pow(1 - x * x, 2) + Math.pow(x / 1.5, 2));
+    } else {
+      a /= 1 + Math.pow(fn / 4500, 4);       // speaker roll-off
+    }
     if (cond.micHp) a /= Math.sqrt(1 + Math.pow(cond.micHp / fn, 4)); // phone mic bass roll-off
     partials.push({ w: 2 * Math.PI * fn / sr, a: a, tau: tau0 / (1 + 0.25 * n), ph: 2 * Math.PI * rng() });
   }
@@ -154,4 +162,26 @@ function renderSequence(notes, opts) {
   return out;
 }
 
-module.exports = { VOICINGS, CONDITIONS, OPEN_STRINGS, mulberry32, renderChord, renderChange, renderNote, renderSequence };
+// Fret buzz: the string slaps the next fret once per cycle during the loud attack ->
+// broadband noise bursts, phase-locked to f0, decaying with the vibration amplitude.
+function addBuzz(out, sr, f0, tStart, amount, rng) {
+  const i0 = Math.round(tStart * sr), len = Math.round(0.4 * sr);
+  for (let i = 0; i < len && i0 + i < out.length; i++) {
+    const t = i / sr;
+    const pulse = Math.pow(Math.max(0, Math.sin(2 * Math.PI * f0 * t)), 8);
+    out[i0 + i] += amount * gaussian(rng) * pulse * Math.exp(-t / 0.12);
+  }
+}
+
+// One plucked note for the health checks. opts: { sr, seed, condition, duration, onset, tauScale, buzz, amp }
+function renderPluck(midi, detuneCents, opts) {
+  const sr = opts.sr, rng = mulberry32(opts.seed), cond = CONDITIONS[opts.condition];
+  const out = new Float32Array(Math.round(opts.duration * sr));
+  const f0 = midiToFreq(midi + detuneCents / 100);
+  addPluck(out, sr, f0, opts.onset, opts.amp || 0.8, rng, cond, undefined, opts.tauScale);
+  if (opts.buzz) addBuzz(out, sr, f0, opts.onset, opts.buzz, rng);
+  addNoiseAndHum(out, sr, rng, cond, signalRms(out, Math.round(opts.onset * sr)));
+  return out;
+}
+
+module.exports = { VOICINGS, CONDITIONS, OPEN_STRINGS, mulberry32, renderChord, renderChange, renderNote, renderSequence, renderPluck };
