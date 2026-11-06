@@ -9,8 +9,8 @@ function noiseFloorDb(dsp, x, sr, seconds) {
 
 // Returns [{ t, frame }]. opts: { gateDb, pitch, chords, chroma }
 function streamFrames(dsp, x, sr, opts) {
-  const hop = dsp.CONFIG.hop;
-  const span = Math.max((opts.chroma && opts.chroma.fftSize) || dsp.CONFIG.chroma.fftSize, 8192);
+  const hop = dsp.hopFor(sr);
+  const span = Math.max((opts.chroma && opts.chroma.fftSize) || dsp.fftSizeFor(sr), dsp.yinSpanFor(sr) + Math.round(0.06 * sr));
   const frames = [];
   for (let i = hop; i <= x.length; i += hop) {
     const buf = x.subarray(Math.max(0, i - span), i);

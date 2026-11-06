@@ -120,11 +120,11 @@ var GuitarDSP = (function () {
 
   const CONFIG = Object.freeze({
     a4: 440,
-    hop: 1024,                 // samples between analysis frames (~21 ms @ 48 kHz)
-    gateWindow: 2048,          // samples used for the level gate / onset
+    hopSec: 0.0213,            // time between analysis frames (1024 samples @ 48 kHz); see hopFor(sr)
+    gateWindowSec: 0.0427,     // window for the level gate / onset (2048 samples @ 48 kHz)
     yin: Object.freeze({ windowSec: 0.04, threshold: 0.15, minFreq: 75, maxFreq: 1400 }),
     chroma: Object.freeze({
-      fftSize: 16384, fMin: 70, fMax: 1200, harmonics: 4, harmonicDecay: 0.8,
+      windowSec: 0.34, fMin: 70, fMax: 1200, harmonics: 4, harmonicDecay: 0.8,   // FFT size: fftSizeFor(sr)
       maxHarmonicFreq: 5000, peakCents: 25, floorRemoval: 0.5,
       leak: Object.freeze({ h3: 0.15, h5: 0.3, h7: 0.15 })   // harmonic-leak suppression, tuned by tests/tune-leak.js
     }),
@@ -164,6 +164,14 @@ var GuitarDSP = (function () {
   }
 
   function toDb(x) { return 20 * Math.log10(Math.max(x, 1e-9)); }
+
+  // ---------- sample-rate helpers: everything is defined in seconds, converted per device rate ----------
+  function pow2For(sr, sec) { return Math.pow(2, Math.round(Math.log2(sr * sec))); }
+  function fftSizeFor(sr) { return pow2For(sr, CONFIG.chroma.windowSec); }   // 16384 at 44.1/48 kHz, 32768 at 96 kHz
+  function hopFor(sr) { return Math.max(256, Math.round(sr * CONFIG.hopSec)); }
+  function gateWindowFor(sr) { return Math.round(sr * CONFIG.gateWindowSec); }
+  // samples YIN needs: integration window + longest period searched + interpolation margin
+  function yinSpanFor(sr) { return Math.round(CONFIG.yin.windowSec * sr) + Math.ceil(sr / CONFIG.yin.minFreq) + 2; }
 
   // ---------- standard tuning ----------
   const STRINGS = Object.freeze([
@@ -296,7 +304,7 @@ var GuitarDSP = (function () {
   function refinedPitch(buf, sr) {
     const p = yin(buf, sr);
     if (!p) return null;
-    const need = Math.round(CONFIG.yin.windowSec * sr) + Math.ceil(sr / CONFIG.yin.minFreq) + 2 + Math.round(0.05 * sr);
+    const need = yinSpanFor(sr) + Math.round(0.05 * sr);   // + filter settling
     const seg = buf.length > need ? buf.subarray(buf.length - need) : buf;
     const q = yin(lowpass(seg, sr, Math.min(1.4 * p.freq, 0.45 * sr)), sr);
     return q && Math.abs(1200 * Math.log2(q.freq / p.freq)) < 50 ? { freq: q.freq, clarity: p.clarity } : p;
@@ -357,7 +365,7 @@ var GuitarDSP = (function () {
   }
 
   function chromaOf(buf, sr, opts) {
-    const n = (opts && opts.fftSize) || CONFIG.chroma.fftSize;
+    const n = (opts && opts.fftSize) || fftSizeFor(sr);
     return chromaFromSpectrum(magnitudeSpectrum(buf, n), sr, n, opts);
   }
 
@@ -401,11 +409,11 @@ var GuitarDSP = (function () {
   }
 
   // ---------- frame analysis ----------
-  // buf: the latest samples (length >= chroma fftSize). Returns a plain frame object.
+  // buf: the latest samples (length >= fftSizeFor(sr)). Returns a plain frame object.
   function analyzeFrame(buf, sr, opts) {
     const o = opts || {};
     const gateDb = o.gateDb === undefined ? -60 : o.gateDb;
-    const levelDb = toDb(rms(buf, buf.length - CONFIG.gateWindow));
+    const levelDb = toDb(rms(buf, buf.length - gateWindowFor(sr)));
     const voiced = levelDb > gateDb;
     const frame = { levelDb: levelDb, voiced: voiced, pitch: null, chroma: null, lib: null, all: null };
     if (!voiced) return frame;
@@ -485,6 +493,7 @@ var GuitarDSP = (function () {
     NOTE_NAMES: NOTE_NAMES, CONFIG: CONFIG, STRINGS: STRINGS, LIBRARY: LIBRARY, ALL_CHORDS: ALL_CHORDS, TEMPLATES: TEMPLATES,
     midiToFreq: midiToFreq, noteName: noteName, freqToNote: freqToNote, parseNoteName: parseNoteName,
     rms: rms, toDb: toDb, nearestString: nearestString,
+    pow2For: pow2For, fftSizeFor: fftSizeFor, hopFor: hopFor, gateWindowFor: gateWindowFor, yinSpanFor: yinSpanFor,
     magnitudeSpectrum: magnitudeSpectrum, yin: yin, lowpass: lowpass, refinedPitch: refinedPitch, chromaFromSpectrum: chromaFromSpectrum, chromaOf: chromaOf,
     cosine: cosine, rankChords: rankChords, verifyChord: verifyChord,
     analyzeFrame: analyzeFrame, initTracker: initTracker, stepTracker: stepTracker,
@@ -555,7 +564,7 @@ var GuitarHealth = (function () {
     return s + 1e-20;
   }
   function attackNoise(x, sr, onsetSec) {
-    const n = 4096, binHz = sr / n;
+    const n = DSP.pow2For(sr, 0.085), binHz = sr / n;   // 4096 at 44.1/48 kHz
     const ratioAt = function (startSec) {
       const end = Math.round(startSec * sr) + n;
       if (end > x.length) return null;
@@ -571,7 +580,7 @@ var GuitarHealth = (function () {
   // Median pitch over the steady part (0.25-1.2 s after onset by default). The first ~200 ms of a pluck is sharp.
   function steadyPitch(x, sr, onsetSec, from, to) {
     const a = onsetSec + (from === undefined ? 0.25 : from), b = onsetSec + (to === undefined ? 1.2 : to);
-    const hop = Math.round(0.02 * sr), span = 4096;
+    const hop = Math.round(0.02 * sr), span = DSP.yinSpanFor(sr);
     const freqs = [], clar = [];
     for (let i = Math.round(a * sr); i <= Math.min(x.length, Math.round(b * sr)); i += hop) {
       if (i - span < 0) continue;
@@ -1089,8 +1098,7 @@ const WakeLock = (function () {
 
 const AudioEngine = (function () {
   const DSP = GuitarDSP;
-  const RING = 32768;
-  const ANALYSIS_LEN = DSP.CONFIG.chroma.fftSize;
+  const RING = 65536;                       // >= fftSizeFor(96 kHz)
   // Worklet posts 512-sample batches plus the context frame of the first sample (for latency timing).
   const WORKLET_SRC = [
     'class GcCapture extends AudioWorkletProcessor {',
@@ -1139,8 +1147,8 @@ const AudioEngine = (function () {
     scheduled = false;
     if (!frameListeners.size || total < 4096) return;
     const t0 = performance.now();
-    const frame = DSP.analyzeFrame(latest(ANALYSIS_LEN), ctx.sampleRate, {
-      gateDb: gateDb(), pitch: analysisOpts.pitch, chords: analysisOpts.chords && total >= ANALYSIS_LEN,
+    const frame = DSP.analyzeFrame(latest(DSP.fftSizeFor(ctx.sampleRate)), ctx.sampleRate, {
+      gateDb: gateDb(), pitch: analysisOpts.pitch, chords: analysisOpts.chords && total >= DSP.fftSizeFor(ctx.sampleRate),
       a4: Store.load().settings.a4
     });
     lastCostMs = performance.now() - t0;
@@ -1165,7 +1173,7 @@ const AudioEngine = (function () {
     sinceHop += chunk.length;
     chunkListeners.forEach(function (f) { f(chunk, startFrame); });
     // one analysis per hop; if the device is slow, frames are dropped instead of queueing up
-    if (sinceHop >= DSP.CONFIG.hop && !scheduled) {
+    if (sinceHop >= DSP.hopFor(ctx.sampleRate) && !scheduled) {
       sinceHop = 0;
       scheduled = true;
       setTimeout(analyze, 0);
@@ -1205,15 +1213,38 @@ const AudioEngine = (function () {
   }
 
   // latencyHint 0 asks for the smallest buffer the device allows; older browsers only accept the named hints.
-  function createContext(AC) {
+  function createContext(AC, sampleRate) {
+    const rate = sampleRate ? { sampleRate: sampleRate } : {};
     try {
-      const c = new AC({ latencyHint: 0 });
+      const c = new AC(Object.assign({ latencyHint: 0 }, rate));
       latencyHintUsed = '0 (lowest)';
       return c;
     } catch (e) {
       console.warn('Numeric latencyHint rejected, using "interactive":', e);
       latencyHintUsed = 'interactive (fallback)';
-      return new AC({ latencyHint: 'interactive' });
+      return new AC(Object.assign({ latencyHint: 'interactive' }, rate));
+    }
+  }
+
+  // Run the context at the input device's own rate (e.g. iRig HD 2 at 48 kHz) so Chrome does not resample the input.
+  // Not on iOS: there the context must be created inside the tap, and the system already matches rates.
+  // If the new context cannot start (no user activation), the original one is kept.
+  async function matchInputRate(AC) {
+    const want = trackSettings().sampleRate;
+    const ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (!want || want === ctx.sampleRate || ios) return;
+    let next = null;
+    try {
+      next = createContext(AC, want);
+      await next.resume();
+    } catch (e) {
+      console.warn('Could not open the audio context at ' + want + ' Hz:', e);
+    }
+    if (next && next.state === 'running' && next.sampleRate === want) {
+      ctx.close().catch(function () {});
+      ctx = next;
+    } else if (next) {
+      next.close().catch(function () {});
     }
   }
 
@@ -1242,6 +1273,7 @@ const AudioEngine = (function () {
         : 'Could not open the audio input: ' + e.message);
     }
     await resumed;
+    await matchInputRate(AC);
     source = ctx.createMediaStreamSource(stream);
     await connectCapture();
     const out = await applyOutput();
@@ -1789,7 +1821,8 @@ function CalibrateScreen() {
       'browser-reported latency: base ' + (info.baseLatencyMs === null ? 'n/a' : info.baseLatencyMs.toFixed(1) + ' ms') +
       ', output ' + (info.outputLatencyMs === null ? 'n/a' : info.outputLatencyMs.toFixed(1) + ' ms') + '<br>' +
       flag('echoCancellation') + '<br>' + flag('noiseSuppression') + '<br>' + flag('autoGainControl') + '<br>' +
-      'analysis cost: <span id="cCost">-</span> ms per frame (budget ' + (DSP.CONFIG.hop / info.sampleRate * 1000).toFixed(0) + ' ms)<br>' +
+      'analysis cost: <span id="cCost">-</span> ms per frame (budget ' + (DSP.hopFor(info.sampleRate) / info.sampleRate * 1000).toFixed(0) + ' ms)<br>' +
+      'input device rate: ' + (st.sampleRate || 'not reported') + ' Hz' + (st.sampleRate && st.sampleRate !== info.sampleRate ? ' <span class="pill warn">resampled</span>' : '') + '<br>' +
       'screen wake lock: ' + (WakeLock.supported() ? 'supported' : 'not supported by this browser');
   }
 

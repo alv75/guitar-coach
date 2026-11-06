@@ -3,26 +3,25 @@
 const assert = require('assert');
 const synth = require('./synth');
 
-const SR = 48000;
 const COND = 'di';                         // iRig-style direct input
 const GATE = -50;
 
-function pluck(midi, cents, seed, extra) {
-  return synth.renderPluck(midi, cents, Object.assign({ sr: SR, seed: seed, condition: COND, duration: 2.0, onset: 0.2 }, extra || {}));
+function pluck(sr, midi, cents, seed, extra) {
+  return synth.renderPluck(midi, cents, Object.assign({ sr: sr, seed: seed, condition: COND, duration: 2.0, onset: 0.2 }, extra || {}));
 }
 
-function measure(H, midi, cents, seed, extra) {
-  return H.analyzeNote(pluck(midi, cents, seed, extra), SR, GATE, midi);
+function measure(H, sr, midi, cents, seed, extra) {
+  return H.analyzeNote(pluck(sr, midi, cents, seed, extra), sr, GATE, midi);
 }
 
 // Pitch accuracy of the steady-state measurement across the neck (what intonation/nut/drift rely on).
-function pitchAccuracy(H) {
+function pitchAccuracy(H, sr) {
   const errs = [];
   let seed = 1;
   synth.OPEN_STRINGS.forEach(function (open) {
     [0, 1, 5, 12].forEach(function (fret) {
       const truth = (seed * 7.3) % 20 - 10;   // -10..+10 cents
-      const m = measure(H, open + fret, truth, seed++);
+      const m = measure(H, sr, open + fret, truth, seed++);
       errs.push(m.found ? Math.abs(m.cents - truth) : Infinity);
     });
   });
@@ -30,12 +29,12 @@ function pitchAccuracy(H) {
   return { n: errs.length, median: errs[Math.floor(errs.length / 2)], p95: errs[Math.floor(errs.length * 0.95)], max: errs[errs.length - 1] };
 }
 
-function intonationCases(H) {
+function intonationCases(H, sr) {
   // open string tuned +3 c; 12th fret at +3 + offset
   return [-12, -6, -3, 0, 4, 8, 15].map(function (offset, i) {
     const s = i % 6, open = synth.OPEN_STRINGS[s];
-    const ref = measure(H, open, 3, 100 + i);
-    const fr = measure(H, open + 12, 3 + offset, 200 + i);
+    const ref = measure(H, sr, open, 3, 100 + i);
+    const fr = measure(H, sr, open + 12, 3 + offset, 200 + i);
     const r = H.intonation(s, ref, fr, 'open');
     return { truth: offset, measured: r.offsetCents, status: r.status };
   });
@@ -43,14 +42,14 @@ function intonationCases(H) {
 
 // Fret sweep with planted problems. Buzz is marked by the player; the test checks that buzzing notes still
 // measure correctly and that dead/undetected detection is not disturbed by buzz.
-function sweepCase(H, buzzAmount, seedBase) {
+function sweepCase(H, buzzAmount, seedBase, sr) {
   const plantedBuzz = { '0:3': 1, '2:7': 1, '4:10': 1 };     // string:fret
   const plantedDead = { '1:5': 1, '3:9': 1 };
   const grid = synth.OPEN_STRINGS.map(function (open, s) {
     const row = [];
     for (let f = 1; f <= 12; f++) {
       const key = s + ':' + f;
-      const m = measure(H, open + f, 0, seedBase + s * 20 + f, {
+      const m = measure(H, sr, open + f, 0, seedBase + s * 20 + f, {
         buzz: plantedBuzz[key] ? buzzAmount : 0, tauScale: plantedDead[key] ? 0.2 : 1, amp: 0.6 + 0.4 * ((s * 13 + f * 7) % 10) / 10
       });
       row.push(Object.assign({}, m, { userBuzz: !!plantedBuzz[key] }));   // the player marks buzz by ear

@@ -12,13 +12,14 @@ const { readWav } = require('./wav');
 
 const dsp = loadDsp();
 const SR = 48000;
-const N = dsp.CONFIG.chroma.fftSize;
+
 const CONDITIONS = ['clean', 'room', 'harsh', 'di'];
 const TRIALS = 6;
 const USE_REAL = process.argv.indexOf('--real') >= 0;
 
 // frames from 0.15 s to 1.0 s after the strum, every ~85 ms
 function framesOf(x, sr, onset) {
+  const N = dsp.fftSizeFor(sr);
   const out = [];
   for (let t = onset + 0.15; t <= onset + 1.0 && t * sr <= x.length; t += 0.085) {
     const end = Math.round(t * sr);
@@ -63,7 +64,7 @@ function score(sets, leak) {
   sets.forEach(function (s) {
     const g = byGroup[s.group] || (byGroup[s.group] = { n: 0, ok: 0, leads: [], confusions: {} });
     s.spectra.forEach(function (mag) {
-      const chroma = dsp.chromaFromSpectrum(mag, s.sr, N, { leak: leak });
+      const chroma = dsp.chromaFromSpectrum(mag, s.sr, dsp.fftSizeFor(s.sr), { leak: leak });
       const ranked = dsp.rankChords(chroma, dsp.LIBRARY);
       const mine = ranked.find(function (r) { return r.id === s.chord; }).score;
       const rival = ranked.find(function (r) { return r.id !== s.chord; });

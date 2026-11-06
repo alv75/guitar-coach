@@ -21,7 +21,7 @@ const CONDITIONS = ['clean', 'room', 'harsh', 'di'];
 const TARGETS = { note: 0.98, chord: 0.90 }; // on the 'room' condition (20 dB SNR)
 
 const dsp = loadDsp();
-const FFT = argVal('fft', dsp.CONFIG.chroma.fftSize);
+const FFT = argVal('fft', undefined) || dsp.fftSizeFor(SR);
 let failures = 0;
 
 // ---------- formatting helpers ----------
@@ -51,6 +51,16 @@ function unitChecks() {
   });
   run('nearestString(196.5) = G3, ~+4 cents', function () {
     const s = dsp.nearestString(196.5); assert.strictEqual(s.string.name, 'G3'); assert.ok(Math.abs(s.cents - 4.4) < 0.5);
+  });
+  run('rate helpers: FFT 16384 at 44.1/48 kHz, 32768 at 96 kHz; hop ~21 ms', function () {
+    assert.strictEqual(dsp.fftSizeFor(44100), 16384); assert.strictEqual(dsp.fftSizeFor(48000), 16384);
+    assert.strictEqual(dsp.fftSizeFor(96000), 32768);
+    assert.strictEqual(dsp.hopFor(48000), 1022); assert.ok(Math.abs(dsp.hopFor(44100) / 44100 - 0.0213) < 0.0005);
+  });
+  run('YIN at 96 kHz still finds 82 Hz (window scales with the rate)', function () {
+    const sr = 96000;
+    const x = new Float32Array(dsp.yinSpanFor(sr) + 100).map(function (_, i) { return Math.sin(2 * Math.PI * 82.41 * i / sr); });
+    assert.ok(Math.abs(dsp.freqToNote(dsp.yin(x, sr).freq).cents) < 1);
   });
   run('36 templates; library of 11', function () {
     assert.strictEqual(dsp.ALL_CHORDS.length, 36); assert.strictEqual(dsp.LIBRARY.length, 11);
@@ -201,14 +211,14 @@ function reportReal() {
 }
 
 function reportHealth() {
-  heading('Guitar Health Check (synthetic, iRig-style direct input)');
+  heading('Guitar Health Check (synthetic, iRig-style direct input, ' + SR + ' Hz)');
   const H = loadHealth().health;
   healthSuite.logicChecks(H, check);
-  const pa = healthSuite.pitchAccuracy(H);
+  const pa = healthSuite.pitchAccuracy(H, SR);
   console.log('\n  Steady pitch error over ' + pa.n + ' notes (strings x frets 0/1/5/12, +-10 c detune): median ' +
     pa.median.toFixed(2) + ' c, p95 ' + pa.p95.toFixed(2) + ' c, max ' + pa.max.toFixed(2) + ' c');
   check('steady pitch p95 error < 1.5 cents', pa.p95 < 1.5);
-  const ic = healthSuite.intonationCases(H);
+  const ic = healthSuite.intonationCases(H, SR);
   console.log('  Intonation (true offset -> measured, status): ' + ic.map(function (c) {
     return (c.truth > 0 ? '+' : '') + c.truth + '->' + c.measured.toFixed(1) + ' ' + c.status; }).join(' | '));
   check('intonation status correct on all cases', ic.every(function (c) {
@@ -216,7 +226,7 @@ function reportHealth() {
   console.log('\n  Fret sweep, 72 notes, 3 buzzing (marked by player) + 2 dead notes, varying buzz loudness:');
   const w = [14, 12, 14, 12, 14, 12];
   console.log('  ' + row(['buzz amount', 'buzz found', 'false buzz', 'dead found', 'false dead', 'undetected'], w));
-  const sweeps = [0.02, 0.05, 0.1, 0.2].map(function (a, i) { return healthSuite.sweepCase(H, a, 5000 + i * 1000); });
+  const sweeps = [0.02, 0.05, 0.1, 0.2].map(function (a, i) { return healthSuite.sweepCase(H, a, 5000 + i * 1000, SR); });
   sweeps.forEach(function (r) {
     console.log('  ' + row([r.buzzAmount, r.buzzHit + '/3', r.buzzFalse + '/69', r.deadHit + '/2', r.deadFalse + '/70', r.undetected], w));
   });

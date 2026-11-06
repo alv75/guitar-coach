@@ -43,8 +43,8 @@ work reliably (see `attackNoise` in `health-core`).
 ## Tests
 
 ```
-node tests/run-tests.js            # full: unit checks, synthetic accuracy, health check, real recordings (~15 min)
-node tests/run-tests.js --quick    # fewer trials (~5 min)
+node tests/run-tests.js            # full: unit checks, synthetic accuracy, health check, real recordings (~17-20 min)
+node tests/run-tests.js --quick    # fewer trials (~5 min); add --sr=44100 to test another rate (default 48000)
 node tests/run-tests.js --real-only
 node tests/run-tests.js --health-only
 node tests/tune-leak.js [--real]      # grid search for chord harmonic-leak suppression
