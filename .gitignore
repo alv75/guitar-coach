@@ -1,2 +1,7 @@
 node_modules/
 *.log
+
+# private recordings: never commit audio
+*.wav
+tests/real/*
+!tests/real/README.txt
